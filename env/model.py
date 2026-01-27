@@ -39,14 +39,28 @@ class GraphNeuralNetwork(nn.Module):
         self.to(self.device)
         
         if self.use_mixed_precision:
-            self.scaler = torch.amp.GradScaler()
+            self.scaler = torch.cuda.amp.GradScaler()
     
     def _prune_dead_neurons(self):
         """Prune neurons not reachable from inputs or not reaching outputs."""
-        name_to_node = {n.name: n for n in self._adj.keys()}
+        # Map node ids to node objects
+        id_to_node = {n.idx: n for n in self._adj.keys()}
 
-        input_nodes = [name_to_node[name] for name in self.input_neurons]
-        output_nodes = [name_to_node[name] for name in self.output_neurons]
+        # Normalize input/output identifiers (allow ints or Node-like objects)
+        def _norm(seq):
+            out = []
+            for s in seq:
+                if hasattr(s, 'idx'):
+                    out.append(int(s.idx))
+                else:
+                    out.append(int(s))
+            return out
+
+        input_ids = _norm(self.input_neurons)
+        output_ids = _norm(self.output_neurons)
+
+        input_nodes = [id_to_node[i] for i in input_ids]
+        output_nodes = [id_to_node[i] for i in output_ids]
 
         rev = {n: set() for n in self._adj.keys()}
         for p, childs in self._adj.items():
@@ -80,17 +94,19 @@ class GraphNeuralNetwork(nn.Module):
         keep.update(input_nodes)
         keep.update(output_nodes)
 
-        self._adj = {n: {c for c in childs if c in keep} 
-                     for n, childs in self._adj.items() if n in keep}
+        self._adj = {n: {c for c in childs if c in keep}
+                 for n, childs in self._adj.items() if n in keep}
         self._topo_order = [n for n in self._topo_order if n in keep]
         self._position = {n: i for i, n in enumerate(self._topo_order)}
     
     def _build_vectorized_structures(self):
         """Build fully vectorized structures using scatter/gather operations."""
-        # Map neurons to indices
-        self.neuron_to_idx = {node.name: i for i, node in enumerate(self._topo_order)}
-        self.idx_to_neuron = {i: name for name, i in self.neuron_to_idx.items()}
-        self.num_neurons = len(self.neuron_to_idx)
+        # Map neurons (Node objects) to positions and ids
+        self.neuron_to_pos = {node: i for i, node in enumerate(self._topo_order)}
+        self.nodeid_to_pos = {node.idx: i for i, node in enumerate(self._topo_order)}
+        self.pos_to_node = {i: node for i, node in enumerate(self._topo_order)}
+        self.idx_to_neuron = {i: node.idx for node, i in self.neuron_to_pos.items()}
+        self.num_neurons = len(self.neuron_to_pos)
         
         # Compute layers
         self.layers = self._compute_layers()
@@ -138,9 +154,21 @@ class GraphNeuralNetwork(nn.Module):
         # Store layer sizes
         self.layer_sizes = [len(layer) for layer in self.layers]
         
-        # Input/output indices
-        self.input_indices = [self.neuron_to_idx[name] for name in self.input_neurons]
-        self.output_indices = [self.neuron_to_idx[name] for name in self.output_neurons]
+        # Input/output indices (convert provided identifiers to positions)
+        def _norm_ids(seq):
+            out = []
+            for s in seq:
+                if hasattr(s, 'idx'):
+                    out.append(int(s.idx))
+                else:
+                    out.append(int(s))
+            return out
+
+        input_ids = _norm_ids(self.input_neurons)
+        output_ids = _norm_ids(self.output_neurons)
+
+        self.input_indices = [self.nodeid_to_pos[i] for i in input_ids]
+        self.output_indices = [self.nodeid_to_pos[i] for i in output_ids]
     
     def _compute_layers(self):
         """Group neurons into layers that can be computed in parallel."""
@@ -150,13 +178,23 @@ class GraphNeuralNetwork(nn.Module):
         # Build parent lookup
         parents_per_neuron = [[] for _ in range(self.num_neurons)]
         for parent_node, children in self._adj.items():
-            parent_idx = self.neuron_to_idx[parent_node.name]
+            parent_pos = self.neuron_to_pos[parent_node]
             for child_node in children:
-                child_idx = self.neuron_to_idx[child_node.name]
-                parents_per_neuron[child_idx].append(parent_idx)
+                child_pos = self.neuron_to_pos[child_node]
+                parents_per_neuron[child_pos].append(parent_pos)
         
         # Start with input neurons
-        current_layer = [self.neuron_to_idx[name] for name in self.input_neurons]
+        def _norm(seq):
+            out = []
+            for s in seq:
+                if hasattr(s, 'idx'):
+                    out.append(int(s.idx))
+                else:
+                    out.append(int(s))
+            return out
+
+        input_ids = _norm(self.input_neurons)
+        current_layer = [self.nodeid_to_pos[i] for i in input_ids]
         layers.append(current_layer)
         processed.update(current_layer)
         
@@ -193,22 +231,33 @@ class GraphNeuralNetwork(nn.Module):
     def _validate_structure(self):
         """Validate network structure."""
         adj = self._adj
-        
-        for name in self.input_neurons + self.output_neurons:
-            if name not in [node.name for node in adj.keys()]:
-                raise ValueError(f"Neuron '{name}' not found in graph")
-        
-        for name in self.input_neurons:
-            node = next((n for n in adj.keys() if n.name == name), None)
+        # Normalize ids
+        def _norm(seq):
+            out = []
+            for s in seq:
+                if hasattr(s, 'idx'):
+                    out.append(int(s.idx))
+                else:
+                    out.append(int(s))
+            return out
+
+        ids = _norm(self.input_neurons) + _norm(self.output_neurons)
+        available = {n.idx for n in adj.keys()}
+        for nid in ids:
+            if nid not in available:
+                raise ValueError(f"Neuron '{nid}' not found in graph")
+
+        for nid in _norm(self.input_neurons):
+            node = next((n for n in adj.keys() if n.idx == nid), None)
             if node:
                 parents = [p for p, children in adj.items() if node in children]
                 if parents:
-                    raise ValueError(f"Input neuron '{name}' has incoming edges")
-        
-        for name in self.output_neurons:
-            node = next((n for n in adj.keys() if n.name == name), None)
+                    raise ValueError(f"Input neuron '{nid}' has incoming edges")
+
+        for nid in _norm(self.output_neurons):
+            node = next((n for n in adj.keys() if n.idx == nid), None)
             if node and len(adj[node]) > 0:
-                raise ValueError(f"Output neuron '{name}' has outgoing edges")
+                raise ValueError(f"Output neuron '{nid}' has outgoing edges")
     
     def forward_batch(self, input_tensor: torch.Tensor) -> torch.Tensor:
         """
@@ -257,9 +306,11 @@ class GraphNeuralNetwork(nn.Module):
     
     def forward(self, input_dict: Dict[str, float]) -> Dict[str, torch.Tensor]:
         """Single sample forward pass (legacy compatibility)."""
+        # Build input tensor in same order as provided input_neurons
         input_tensor = torch.zeros(1, len(self.input_neurons), device=self.device)
         for i, name in enumerate(self.input_neurons):
-            input_tensor[0, i] = input_dict.get(name, 0.0)
+            key = name.idx if hasattr(name, 'idx') else int(name)
+            input_tensor[0, i] = input_dict.get(key, 0.0)
         
         # Get all layer activations
         layer_activations = [input_tensor]
@@ -285,9 +336,9 @@ class GraphNeuralNetwork(nn.Module):
         for layer_idx, layer_indices in enumerate(self.layers):
             if layer_idx < len(layer_activations):
                 for local_idx, global_idx in enumerate(layer_indices):
-                    neuron_name = self.idx_to_neuron[global_idx]
-                    neuron_values[neuron_name] = layer_activations[layer_idx][0, local_idx].unsqueeze(0)
-        
+                    neuron_id = self.idx_to_neuron[global_idx]
+                    neuron_values[neuron_id] = layer_activations[layer_idx][0, local_idx].unsqueeze(0)
+
         return neuron_values
     
     def train_step_batch(self, input_batch: torch.Tensor, target_batch: torch.Tensor,
@@ -296,7 +347,7 @@ class GraphNeuralNetwork(nn.Module):
         optimizer.zero_grad()
         
         if self.use_mixed_precision:
-            with torch.amp.autocast('cuda'):
+            with torch.cuda.amp.autocast():
                 outputs = self.forward_batch(input_batch)
                 loss = criterion(outputs, target_batch)
             self.scaler.scale(loss).backward()
@@ -317,9 +368,11 @@ class GraphNeuralNetwork(nn.Module):
         target_tensor = torch.zeros(1, len(self.output_neurons), device=self.device)
         
         for i, name in enumerate(self.input_neurons):
-            input_tensor[0, i] = inputs.get(name, 0.0)
+            key = name.idx if hasattr(name, 'idx') else int(name)
+            input_tensor[0, i] = inputs.get(key, 0.0)
         for i, name in enumerate(self.output_neurons):
-            target_tensor[0, i] = targets.get(name, 0.0)
+            key = name.idx if hasattr(name, 'idx') else int(name)
+            target_tensor[0, i] = targets.get(key, 0.0)
         
         return self.train_step_batch(input_tensor, target_tensor, optimizer, criterion)
     

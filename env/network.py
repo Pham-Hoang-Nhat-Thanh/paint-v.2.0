@@ -1,172 +1,310 @@
-class Node:
-    def __init__(self, name):
-        self.name = name
+from collections import deque
+from typing import List, Tuple
+import numpy as np
+from utils.lru_cache import LRUCache
+import torch
 
-    def __repr__(self):
-        return f"Node({self.name})"
+class Node:
+    """Lightweight node for neural network DAG."""
+    __slots__ = ('idx', 'node_type')
     
-    def __eq__(self, value):
-        return isinstance(value, Node) and self.name == value.name
+    def __init__(self, idx: int, node_type: str):
+        self.idx = idx
+        self.node_type = node_type
+    
+    def __repr__(self):
+        return f"N{self.idx}"
+    
+    def __eq__(self, other):
+        return isinstance(other, Node) and self.idx == other.idx
     
     def __hash__(self):
-        return hash(self.name)
+        return self.idx
 
 
-class GraphNetwork:
-    def __init__(self):
-        # direct adjacency only; `children`/`parents` removed
-        self.adjacency = {}
-        # Topological order (list) and position map for incremental maintenance
-        self.topo_order = []
-        self.position = {}
-
-    def add_node(self, node):
-        if node not in self.adjacency:
-            self.adjacency[node] = set()
-            # place new nodes at the end of the topological order
-            self.position[node] = len(self.topo_order)
-            self.topo_order.append(node)
-
-    def is_valid_edge(self, parent, child):
-        """
-        Check if adding an edge from parent to child would create a cycle.
+class NASGraph:
+    """
+    Optimized DAG for Neural Architecture Search.
+    
+    Improvements in v2.0:
+    - O(N) topological reordering using deque
+    - Cleaner reachability caching
+    """
+    
+    def __init__(self, n_input: int, n_hidden: int, n_output: int):
+        if n_input <= 0 or n_hidden < 0 or n_output <= 0:
+            raise ValueError("Invalid graph dimensions")
         
-        :param parent: parent node
-        :param child: child node
-        """
-        self.add_node(parent)
-        self.add_node(child)
-
-        if parent == child:
+        self.n_input = n_input
+        self.n_hidden = n_hidden
+        self.n_output = n_output
+        self.n_nodes = n_input + n_hidden + n_output
+        
+        # Create nodes (immutable)
+        self.nodes = tuple(Node(i, self._get_type(i)) for i in range(self.n_nodes))
+        
+        # Sparse adjacency
+        self.adjacency = {node: set() for node in self.nodes}
+        
+        # Topological ordering (using deque for O(1) operations)
+        self.topo_order = deque(self.nodes)
+        self.position = {node: i for i, node in enumerate(self.nodes)}
+        
+        # Zobrist hashing
+        self._init_zobrist()
+        self.current_hash = 0
+        
+        # Reachability cache (LRU)
+        self._reach_cache = LRUCache(max_size=5000)
+        # Cached sparse features and PyG Data representation to avoid repeated Python conversion
+        self._edges_np = None
+        self._pyg_data = None
+        # Cached torch tensors per device (keyed by device string)
+        self._pyg_tensors = {}
+    
+    def _get_type(self, idx: int) -> str:
+        if idx < self.n_input:
+            return 'input'
+        elif idx < self.n_input + self.n_hidden:
+            return 'hidden'
+        return 'output'
+    
+    def _init_zobrist(self):
+        """Initialize Zobrist hash table."""
+        rng = np.random.RandomState(42)
+        self.zobrist = {}
+        for i in range(self.n_nodes):
+            for j in range(self.n_nodes):
+                if i != j:
+                    self.zobrist[(i, j)] = rng.randint(1, 2**62, dtype=np.int64)
+    
+    def copy(self) -> 'NASGraph':
+        """Efficient copy with shared immutable data."""
+        g = NASGraph.__new__(NASGraph)
+        g.n_input = self.n_input
+        g.n_hidden = self.n_hidden
+        g.n_output = self.n_output
+        g.n_nodes = self.n_nodes
+        g.nodes = self.nodes  # Shared
+        g.zobrist = self.zobrist  # Shared
+        
+        # Deep copy mutable state
+        g.adjacency = {n: s.copy() for n, s in self.adjacency.items()}
+        g.topo_order = self.topo_order.copy()
+        g.position = self.position.copy()
+        g.current_hash = self.current_hash
+        g._reach_cache = LRUCache(max_size=5000)
+        g._edges_np = None
+        g._pyg_data = None
+        g._pyg_tensors = {}
+        return g
+    
+    def is_valid_add(self, u_idx: int, v_idx: int) -> bool:
+        """Check if adding edge u->v is valid (O(1) typical case)."""
+        if u_idx == v_idx:
             return False
-        if child in self.adjacency[parent]:
-            return False # Already exists
 
-        # quick check using topological order: if parent comes before child,
-        # adding the edge cannot create a cycle. Otherwise check reachability
-        # from child -> parent.
-        if self.position[parent] < self.position[child]:
+        # Disallow edges into input nodes and out of output nodes
+        if v_idx < self.n_input:
+            return False
+        if u_idx >= self.n_input + self.n_hidden:
+            return False
+        
+        u, v = self.nodes[u_idx], self.nodes[v_idx]
+        if v in self.adjacency[u]:
+            return False
+        
+        # Fast path: topological order check
+        if self.position[u] < self.position[v]:
             return True
-
-        # parent is after child in current order; adding edge may create a cycle
-        return not self._reachable(child, parent)
-
-    def add_edge(self, parent, child):
-        """
-        Add a directed edge from parent to child if it doesn't create a cycle.
         
-        :param parent: parent node
-        :param child: child node
+        # Check cache
+        cache_key = (self.current_hash, u_idx, v_idx)
+        cached = self._reach_cache.get(cache_key)
+        if cached is not None:
+            return not cached
+        
+        # Slow path: reachability
+        reachable = self._reachable(v, u)
+        self._reach_cache.put(cache_key, reachable)
+        return not reachable
+    
+    def add_edge(self, u_idx: int, v_idx: int) -> bool:
         """
-        # Ensure nodes exist
-        self.add_node(parent)
-        self.add_node(child)
-
-        if parent == child:
-            print("Adding self-edge is not allowed")
+        Add edge with O(N) topological reordering.
+        
+        Improvement: Uses deque for O(1) append/remove operations.
+        """
+        if u_idx == v_idx:
             return False
 
-        if child in self.adjacency[parent]:
+        # Disallow edges into input nodes and out of output nodes
+        if v_idx < self.n_input:
+            return False
+        if u_idx >= self.n_input + self.n_hidden:
             return False
 
-        # Fast check using topological positions
-        if self.position[parent] < self.position[child]:
-            # safe to add, preserves topo order
-            self.adjacency[parent].add(child)
-        else:
-            # parent is after child: check if child reaches parent (would form cycle)
-            if self._reachable(child, parent):
-                print("Adding edge from {} to {} would create a cycle.".format(parent, child))
-                return False
-
-            # No cycle — we must move the affected nodes (those reachable from
-            # child that are positioned <= parent) to just after parent.
-            parent_pos = self.position[parent]
-            # compute reachable set constrained by position
-            affected = [n for n in self._reachable_nodes(child) if self.position.get(n, float('inf')) <= parent_pos]
-            if affected:
-                # preserve current relative order
-                affected_set = set(affected)
-                new_order = [n for n in self.topo_order if n not in affected_set]
-                # find parent index in new_order
-                insert_idx = new_order.index(parent) + 1
-                # insert affected nodes after parent
-                for i, n in enumerate(affected):
-                    new_order.insert(insert_idx + i, n)
-                # update topo_order and positions
-                self.topo_order = new_order
-                for idx, n in enumerate(self.topo_order):
-                    self.position[n] = idx
-
-            # finally add the edge
-            self.adjacency[parent].add(child)
-
-        return True
-
-    def _reachable(self, start, target):
-        """Return True if target reachable from start via `adjacency` (DFS)."""
-        if start == target:
+        u, v = self.nodes[u_idx], self.nodes[v_idx]
+        if v in self.adjacency[u]:
+            return False
+        
+        # Fast path
+        if self.position[u] < self.position[v]:
+            self.adjacency[u].add(v)
+            self.current_hash ^= self.zobrist[(u_idx, v_idx)]
+            self._reach_cache.clear()
             return True
-        visited = set()
-        stack = [start]
-        while stack:
-            cur = stack.pop()
-            if cur in visited:
-                continue
-            visited.add(cur)
-            for ch in self.adjacency.get(cur, ()):  # direct edges
-                if ch == target:
-                    return True
-                if ch not in visited:
-                    stack.append(ch)
-        return False
-
-    def _reachable_nodes(self, start):
-        """Return list of nodes reachable from `start` in topological order."""
-        visited = set()
-        stack = [start]
-        result = []
-        while stack:
-            cur = stack.pop()
-            if cur in visited:
-                continue
-            visited.add(cur)
-            result.append(cur)
-            for ch in self.adjacency.get(cur, ()):  # direct edges
-                if ch not in visited:
-                    stack.append(ch)
-        # return nodes in the order they appear in topo_order
-        result_in_order = [n for n in self.topo_order if n in visited]
-        return result_in_order
-
-    def add_edges(self, edges):
-        """
-        Add multiple edges to the graph.
         
-        :param edges: list of (parent, child) tuples
-        """
-        for parent, child in edges:
-            if not self.add_edge(parent, child):
-                raise ValueError("Cannot add edge from {} to {} as it creates a cycle.".format(parent, child))
+        # Check cycle
+        if self._reachable(v, u):
+            return False
+        
+        # Reorder: O(N) using deque
+        u_pos = self.position[u]
+        affected = [n for n in self._reachable_nodes(v) if self.position[n] <= u_pos]
+        
+        if affected:
+            affected_set = set(affected)
+            # Build new order efficiently
+            new_order = deque()
+            u_found = False
             
-    def remove_edge(self, parent, child):
-        """
-        Remove a directed edge from parent to child.
+            for node in self.topo_order:
+                if node not in affected_set:
+                    new_order.append(node)
+                    if node == u:
+                        u_found = True
+                        # Insert affected nodes after u
+                        new_order.extend(affected)
+            
+            self.topo_order = new_order
+            self.position = {n: i for i, n in enumerate(new_order)}
         
-        :param parent: parent node
-        :param child: child node
-        """
-        if parent in self.adjacency and child in self.adjacency[parent]:
-            self.adjacency[parent].remove(child)
+        self.adjacency[u].add(v)
+        self.current_hash ^= self.zobrist[(u_idx, v_idx)]
+        # Invalidate cached sparse features / pyg data and reachability cache
+        self._reach_cache.clear()
+        self._edges_np = None
+        self._pyg_data = None
+        self._pyg_tensors.clear()
+        return True
+    
+    def remove_edge(self, u_idx: int, v_idx: int) -> bool:
+        """Remove edge."""
+        u, v = self.nodes[u_idx], self.nodes[v_idx]
+        if v in self.adjacency[u]:
+            self.adjacency[u].remove(v)
+            self.current_hash ^= self.zobrist[(u_idx, v_idx)]
+            # Invalidate cached sparse features / pyg data and reachability cache
+            self._reach_cache.clear()
+            self._edges_np = None
+            self._pyg_data = None
+            self._pyg_tensors.clear()
             return True
         return False
     
-    def remove_edges(self, edges):
+    def toggle_edge(self, u_idx: int, v_idx: int) -> bool:
+        """Toggle edge."""
+        u, v = self.nodes[u_idx], self.nodes[v_idx]
+        if v in self.adjacency[u]:
+            return self.remove_edge(u_idx, v_idx)
+        return self.add_edge(u_idx, v_idx)
+    
+    def _reachable(self, start: Node, target: Node) -> bool:
+        """Check if target is reachable from start."""
+        if start == target:
+            return True
+        visited = set([start])
+        stack = [start]
+        while stack:
+            cur = stack.pop()
+            for child in self.adjacency[cur]:
+                if child == target:
+                    return True
+                if child not in visited:
+                    visited.add(child)
+                    stack.append(child)
+        return False
+    
+    def _reachable_nodes(self, start: Node) -> List[Node]:
+        """Get all nodes reachable from start in topological order."""
+        visited = set([start])
+        stack = [start]
+        while stack:
+            cur = stack.pop()
+            for child in self.adjacency[cur]:
+                if child not in visited:
+                    visited.add(child)
+                    stack.append(child)
+        return [n for n in self.topo_order if n in visited]
+    
+    def get_hash(self) -> int:
+        return self.current_hash
+    
+    def get_num_edges(self) -> int:
+        return sum(len(children) for children in self.adjacency.values())
+    
+    def to_sparse_features(self) -> Tuple[np.ndarray, int]:
+        """Return edge list for GNN input."""
+        # Return a cached numpy array of edges when available to avoid repeated Python loops
+        if self._edges_np is not None:
+            return self._edges_np, self.n_nodes
+
+        edges = []
+        for u in self.nodes:
+            # iterate adjacency set (Python-level) but only once per distinct graph
+            for v in self.adjacency[u]:
+                edges.append([u.idx, v.idx])
+
+        if not edges:
+            self._edges_np = np.zeros((0, 2), dtype=np.int32)
+        else:
+            self._edges_np = np.array(edges, dtype=np.int32)
+
+        return self._edges_np, self.n_nodes
+
+    def to_pyg_data(self):
+        """Return a cached PyG `Data`-like lightweight dict to avoid repeated tensor creation.
+
+        This avoids rebuilding node type arrays and edge index tensors on every evaluator call.
+        The returned object is a simple dict with keys `x` (np.ndarray) and `edge_index` (np.ndarray).
         """
-        Remove multiple edges from the graph.
-        
-        :param edges: list of (parent, child) tuples
+        if self._pyg_data is not None:
+            return self._pyg_data
+
+        edges, n = self.to_sparse_features()
+        # Node types as numpy array (0=input,1=hidden,2=output)
+        node_types = np.zeros(n, dtype=np.int64)
+        node_types[self.n_input:self.n_input+self.n_hidden] = 1
+        node_types[self.n_input+self.n_hidden:] = 2
+
+        # Edge index as shape (2, E)
+        if edges.size == 0:
+            edge_index = np.zeros((2, 0), dtype=np.int64)
+        else:
+            edge_index = edges.T.astype(np.int64)
+
+        self._pyg_data = {'x': node_types, 'edge_index': edge_index}
+        return self._pyg_data
+
+    def to_torch_tensors(self, device: torch.device):
+        """Return cached PyG tensors on the requested device.
+
+        Caches tensors per-device to avoid repeated CPU->GPU copies.
         """
-        for parent, child in edges:
-            if not self.remove_edge(parent, child):
-                raise ValueError("Edge from {} to {} does not exist.".format(parent, child))
+        dev_key = str(device)
+        if dev_key in self._pyg_tensors:
+            return self._pyg_tensors[dev_key]
+
+        pyg = self.to_pyg_data()
+
+        # Create tensors directly on the target device
+        if pyg['edge_index'].size == 0:
+            edge_index = torch.zeros((2, 0), dtype=torch.long, device=device)
+        else:
+            edge_index = torch.tensor(pyg['edge_index'], dtype=torch.long, device=device)
+
+        x = torch.tensor(pyg['x'], dtype=torch.long, device=device)
+
+        self._pyg_tensors[dev_key] = {'x': x, 'edge_index': edge_index}
+        return self._pyg_tensors[dev_key]

@@ -1,2 +1,4 @@
-torch
+torch==2.1.0 --index-url https://download.pytorch.org/whl/cu118
 torchvision
+torch-geometric
+torch-scatter -f https://data.pyg.org/whl/torch-2.1.0+cu118.html
