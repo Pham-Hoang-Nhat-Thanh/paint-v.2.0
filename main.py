@@ -67,8 +67,8 @@ def example_main():
         mcts_coordinator=mcts,
         initial_graph_fn=lambda: NASGraph(n_input, n_hidden, n_output),
         reward_fn=reward_fn,
-        max_steps=1000,
-        num_simulations=1000
+        max_steps=100,
+        num_simulations=10
     )
     
     # Replay buffer
@@ -93,7 +93,7 @@ def example_main():
         num_iterations=100,
         episodes_per_iteration=5,
         train_steps_per_iteration=50,
-        batch_size=16
+        batch_size=32
     )
 
 

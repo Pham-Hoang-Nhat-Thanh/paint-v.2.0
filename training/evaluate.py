@@ -246,40 +246,40 @@ class ArchitectureEvaluator:
             }
 
 
-def reward_function(evaluator: ArchitectureEvaluator):
+def reward_function(evaluator: ArchitectureEvaluator, accuracy_threshold: float = 0.8):
     """
+    Create a reward function that applies complexity penalties only when
+    the architecture reaches `accuracy_threshold` accuracy.
     """
     def reward_function(graph) -> float:
         """
         Reward based on actual architecture performance.
-        
-        Formula: accuracy - λ_params * log(params) - λ_edges * log(edges)
-        
-        Balances:
-        - Performance (accuracy)
-        - Efficiency (fewer parameters)
-        - Simplicity (fewer edges)
+
+        Primary objective: accuracy.
+        Complexity penalties (params, edges) are applied only when
+        accuracy >= accuracy_threshold.
         """
         # Evaluate architecture
         results = evaluator.evaluate(graph)
-        
+
         accuracy = results['accuracy']
         num_params = results['num_params']
         num_edges = results['num_edges']
-        
-        # Multi-objective reward
-        reward = accuracy  # Primary: maximize accuracy
-        
-        # Penalize complexity (optional)
-        if num_params > 0:
-            reward -= 0.01 * np.log(num_params + 1)  # Small parameter penalty
-        
-        if num_edges > 0:
-            reward -= 0.001 * np.log(num_edges + 1)  # Small edge penalty
-        
-        print(f"  [REWARD] Acc: {accuracy:.4f}, Params: {num_params}, Edges: {num_edges} → Reward: {reward:.4f}")
-        
+
+        # Base reward is accuracy
+        reward = accuracy
+
+        # Apply complexity penalties only when accuracy meets threshold
+        if accuracy >= accuracy_threshold:
+            if num_params > 0:
+                reward -= 0.01 * np.log(num_params + 1)  # Small parameter penalty
+
+            if num_edges > 0:
+                reward -= 0.001 * np.log(num_edges + 1)  # Small edge penalty
+
+        print(f"  [REWARD] Acc: {accuracy:.4f}, Params: {num_params}, Edges: {num_edges} → Reward: {reward:.4f} (penalties applied)")
+
         return reward
-    
+
     return reward_function
 
