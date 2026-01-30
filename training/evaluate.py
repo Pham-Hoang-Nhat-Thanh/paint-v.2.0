@@ -169,6 +169,26 @@ class ArchitectureEvaluator:
         try:
             # Convert to trainable network
             model = self._graph_to_network(nas_graph)
+
+            # Quick sanity check: ensure model output size matches evaluator classes
+            try:
+                input_dim = len(model.input_indices)
+            except Exception:
+                input_dim = None
+
+            if input_dim is not None:
+                dummy_in = torch.zeros(1, input_dim, device=model.device)
+                try:
+                    out = model.forward_batch(dummy_in)
+                    n_out = out.size(1)
+                except Exception as e:
+                    raise RuntimeError(f"Failed to run forward_batch sanity check: {e}")
+
+                if n_out != self.num_classes:
+                    raise ValueError(
+                        f"Model output size ({n_out}) does not match evaluator num_classes ({self.num_classes}). "
+                        "This usually means the NASGraph output nodes do not align with dataset classes."
+                    )
             
             # Setup optimizer
             optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
@@ -235,7 +255,9 @@ class ArchitectureEvaluator:
             return results
             
         except Exception as e:
-            print(f"  [ERROR] Evaluation failed: {e}")
+            import traceback as _tb
+            _tb.print_exc()
+            print(f"  [ERROR] Evaluation failed: type={type(e).__name__}, repr={repr(e)}")
             # Return poor performance on failure
             return {
                 'accuracy': 0.0,
@@ -277,7 +299,7 @@ def reward_function(evaluator: ArchitectureEvaluator, accuracy_threshold: float 
             if num_edges > 0:
                 reward -= 0.001 * np.log(num_edges + 1)  # Small edge penalty
 
-        print(f"  [REWARD] Acc: {accuracy:.4f}, Params: {num_params}, Edges: {num_edges} → Reward: {reward:.4f} (penalties applied)")
+        print(f"  [REWARD] Acc: {accuracy:.4f}, Params: {num_params}, Edges: {num_edges} → Reward: {reward:.4f}")
 
         return reward
 

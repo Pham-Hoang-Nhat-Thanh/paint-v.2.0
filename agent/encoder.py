@@ -6,8 +6,7 @@ from torch_geometric.nn import GATv2Conv
 
 class GraphEncoder(nn.Module):
     """
-    Graph encoder using GAT (Graph Attention Networks).
-    Supports batched graph processing.
+    Graph encoder with proper residual connections and regularization.
     """
     
     def __init__(self, 
@@ -15,67 +14,72 @@ class GraphEncoder(nn.Module):
                  hidden_dim: int = 128,
                  num_layers: int = 4,
                  num_heads: int = 4,
-                 dropout: float = 0.1):
+                 dropout: float = 0.2):
         super().__init__()
         
         self.node_input_dim = node_input_dim
         self.hidden_dim = hidden_dim
+        self.num_layers = num_layers
         
         # Node type embedding
         self.node_embedding = nn.Embedding(3, node_input_dim)
         
-        # GAT layers
+        # Initial projection to hidden_dim
+        self.input_proj = nn.Sequential(
+            nn.Linear(node_input_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout)
+        )
+        
+        # GAT layers with residual connections
         self.gat_layers = nn.ModuleList()
-        in_dim = node_input_dim
+        self.layer_norms = nn.ModuleList()
+        self.dropouts = nn.ModuleList()
         
         for i in range(num_layers):
-            out_dim = hidden_dim // num_heads if i < num_layers - 1 else hidden_dim
+            # GAT layer
             self.gat_layers.append(
                 GATv2Conv(
-                    in_channels=in_dim,
-                    out_channels=out_dim,
-                    heads=num_heads if i < num_layers - 1 else 1,
+                    in_channels=hidden_dim,
+                    out_channels=hidden_dim // num_heads,
+                    heads=num_heads,
                     dropout=dropout,
-                    concat=True if i < num_layers - 1 else False
+                    concat=True,
+                    add_self_loops=True
                 )
             )
-            in_dim = hidden_dim
-        
-        # Layer normalization
-        self.layer_norms = nn.ModuleList([
-            nn.LayerNorm(hidden_dim) for _ in range(num_layers)
-        ])
-        
-        self.dropout = nn.Dropout(dropout)
+            
+            # Normalization and dropout
+            self.layer_norms.append(nn.LayerNorm(hidden_dim))
+            self.dropouts.append(nn.Dropout(dropout))
         
     def forward(self, node_types: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            node_types: [total_nodes] node type indices (batched)
-            edge_index: [2, total_edges] edge list (batched)
+            node_types: [total_nodes] node type indices
+            edge_index: [2, total_edges] edge list
         
         Returns:
             Node embeddings [total_nodes, hidden_dim]
         """
-        # Ensure inputs are on the same device as model parameters
-        device = self.node_embedding.weight.device
-        if node_types.device != device:
-            node_types = node_types.to(device)
-        if edge_index.device != device:
-            edge_index = edge_index.to(device)
-
+        # Initial embedding
         x = self.node_embedding(node_types)
+        x = self.input_proj(x)
         
-        for i, (gat, norm) in enumerate(zip(self.gat_layers, self.layer_norms)):
+        # GAT layers with residual connections
+        for gat, norm, dropout in zip(self.gat_layers, self.layer_norms, self.dropouts):
             x_residual = x
+            
+            # GAT convolution
             x = gat(x, edge_index)
-            x = self.dropout(x)
+            x = dropout(x)
             
-            if x.shape[-1] == x_residual.shape[-1]:
-                x = x + x_residual
+            # Residual connection
+            x = x + x_residual
             
+            # Post-normalization
             x = norm(x)
             x = F.relu(x)
         
         return x
-

@@ -168,7 +168,22 @@ class GraphNeuralNetwork(nn.Module):
         output_ids = _norm_ids(self.output_neurons)
 
         self.input_indices = [self.nodeid_to_pos[i] for i in input_ids]
+        # Positions in the global topo ordering for outputs
         self.output_indices = [self.nodeid_to_pos[i] for i in output_ids]
+
+        # Build mapping from global position -> (layer_idx, local_idx) so we can
+        # retrieve output activations even if outputs live in different layers.
+        self.global_to_layer_local = {}
+        for layer_idx, layer in enumerate(self.layers):
+            for local_idx, global_pos in enumerate(layer):
+                self.global_to_layer_local[global_pos] = (layer_idx, local_idx)
+
+        # For each requested output global position, record its (layer_idx, local_idx)
+        self.output_layer_local = []
+        for pos in self.output_indices:
+            if pos not in self.global_to_layer_local:
+                raise ValueError(f"Output position {pos} not found in any computed layer; layers may be incomplete")
+            self.output_layer_local.append(self.global_to_layer_local[pos])
     
     def _compute_layers(self):
         """Group neurons into layers that can be computed in parallel."""
@@ -269,9 +284,9 @@ class GraphNeuralNetwork(nn.Module):
         """
         batch_size = input_tensor.shape[0]
         layer_output = input_tensor
-        
+        layer_outputs = [layer_output]
+
         for layer_idx, layer_module in enumerate(self.layer_params):
-            curr_layer_size = self.layer_sizes[layer_idx + 1]
             
             # Initialize with bias
             next_output = layer_module.bias.unsqueeze(0).expand(batch_size, -1).clone()
@@ -301,7 +316,15 @@ class GraphNeuralNetwork(nn.Module):
             
             # Apply activation
             layer_output = self.activation_fn(next_output)
-        
+            layer_outputs.append(layer_output)
+
+        # Build output tensor by gathering activations from the recorded layer/local indices
+        if hasattr(self, 'output_layer_local') and len(self.output_layer_local) > 0:
+            out_cols = []
+            for layer_idx, local_idx in self.output_layer_local:
+                out_cols.append(layer_outputs[layer_idx][:, local_idx].unsqueeze(1))
+            return torch.cat(out_cols, dim=1)
+
         return layer_output
     
     def forward(self, input_dict: Dict[str, float]) -> Dict[str, torch.Tensor]:
@@ -349,12 +372,34 @@ class GraphNeuralNetwork(nn.Module):
         if self.use_mixed_precision:
             with torch.cuda.amp.autocast():
                 outputs = self.forward_batch(input_batch)
+                # Validate target indices when using classification loss
+                if isinstance(criterion, nn.CrossEntropyLoss) or target_batch.dtype in (torch.long, torch.int64):
+                    tq = target_batch.detach()
+                    if tq.dim() == 2 and tq.size(1) == 1:
+                        tq = tq.view(-1)
+                    if tq.dim() == 1:
+                        if tq.numel() > 0:
+                            tmin = int(tq.min().item())
+                            tmax = int(tq.max().item())
+                            if tmin < 0 or tmax >= outputs.size(1):
+                                raise ValueError(f"Target labels out of range: min={tmin}, max={tmax}, num_outputs={outputs.size(1)}")
                 loss = criterion(outputs, target_batch)
             self.scaler.scale(loss).backward()
             self.scaler.step(optimizer)
             self.scaler.update()
         else:
             outputs = self.forward_batch(input_batch)
+            # Validate target indices when using classification loss
+            if isinstance(criterion, nn.CrossEntropyLoss) or target_batch.dtype in (torch.long, torch.int64):
+                tq = target_batch.detach()
+                if tq.dim() == 2 and tq.size(1) == 1:
+                    tq = tq.view(-1)
+                if tq.dim() == 1:
+                    if tq.numel() > 0:
+                        tmin = int(tq.min().item())
+                        tmax = int(tq.max().item())
+                        if tmin < 0 or tmax >= outputs.size(1):
+                            raise ValueError(f"Target labels out of range: min={tmin}, max={tmax}, num_outputs={outputs.size(1)}")
             loss = criterion(outputs, target_batch)
             loss.backward()
             optimizer.step()

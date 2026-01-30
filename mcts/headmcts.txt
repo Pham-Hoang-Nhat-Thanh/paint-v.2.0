@@ -1,0 +1,409 @@
+# class HeadMCTS:
+#     def __init__(self, 
+#                  head_id: int,
+#                  node_indices: List[int],
+#                  c_puct: float = 1.0,
+#                  dirichlet_alpha: float = 0.3,
+#                  dirichlet_epsilon: float = 0.25,
+#                  virtual_loss: int = 3,
+#                  prune_threshold: float = 0.01,
+#                  min_expansions: int = 5,
+#                  cache_size: int = 10000,
+#                  use_numba: bool = True):
+#         self.head_id = head_id
+#         self.node_indices = sorted(node_indices)
+#         self.c_puct = c_puct
+#         self.dirichlet_alpha = dirichlet_alpha
+#         self.dirichlet_epsilon = dirichlet_epsilon
+#         self.virtual_loss_value = virtual_loss
+        
+#         self.actions = tuple((u, v) for u in self.node_indices 
+#                             for v in self.node_indices if u != v)
+#         self.n_actions = len(self.actions)
+#         self.action_to_idx = {a: i for i, a in enumerate(self.actions)}
+        
+#         # Pre-extract arrays for Numba
+#         self._u_arr = np.array([a[0] for a in self.actions], dtype=np.int32)
+#         self._v_arr = np.array([a[1] for a in self.actions], dtype=np.int32)
+#         self.use_numba = use_numba and HAS_NUMBA
+        
+#         self.root: Optional[MCTSNode] = None
+#         self._lock = threading.Lock()
+#         self._expansion_lock = threading.Lock()
+#         self._valid_cache = LRUCache(max_size=cache_size)
+#         self._policy_cache = LRUCache(max_size=cache_size)
+        
+#         self._root_noise: Optional[np.ndarray] = None
+#         self._root_hash: Optional[int] = None
+        
+#         self.total_simulations = 0
+#         self._executor: Optional[ThreadPoolExecutor] = None
+#         self._executor_threads = 0
+    
+#     def _get_executor(self, num_threads: int) -> ThreadPoolExecutor:
+#         if self._executor is None or self._executor_threads != num_threads:
+#             if self._executor is not None:
+#                 self._executor.shutdown(wait=False)
+#             self._executor = ThreadPoolExecutor(max_workers=num_threads)
+#             self._executor_threads = num_threads
+#         return self._executor
+    
+#     def __del__(self):
+#         if self._executor is not None:
+#             self._executor.shutdown(wait=False)
+    
+#     def search(self, 
+#                state: Any,
+#                evaluator: Evaluator,
+#                num_simulations: int,
+#                num_threads: int = 1) -> np.ndarray:
+#         state_hash = state.get_hash()
+#         if self.root is None or self.root.state_hash != state_hash:
+#             with self._lock:
+#                 if self.root is None or self.root.state_hash != state_hash:
+#                     self.root = MCTSNode(state_hash=state_hash, parent=None, action=None)
+#                     self.root._state_cache = state.copy()
+#                     self._valid_cache.clear()
+#                     self._policy_cache.clear()
+#                     self._root_noise = None
+#                     self._root_hash = None
+        
+#         if num_threads == 1:
+#             # FAST PATH: Backtracking, no locks, no virtual loss
+#             self._search_sequential_fast(state, evaluator, num_simulations)
+#         else:
+#             self._search_parallel(state, evaluator, num_simulations, num_threads)
+        
+#         self.total_simulations += num_simulations
+#         return self._get_visit_distribution()
+    
+#     def _search_sequential_fast(self, state: Any, evaluator: Evaluator, num_sims: int):
+#         """
+#         Optimized sequential search with ZERO state copying.
+#         Uses in-place mutation + backtracking.
+#         """
+#         # Single work state that we mutate and revert
+#         work_state = state.copy()
+#         toggle = work_state.toggle_edge
+#         head_id = self.head_id
+#         c_puct = self.c_puct
+        
+#         for _ in range(num_sims):
+#             node = self.root
+#             path = []
+#             undo_stack = []  # Track (u, v) to undo
+            
+#             # SELECTION: Descend with in-place mutation
+#             while node.children:
+#                 # Extract arrays for Numba speedup
+#                 children_items = list(node.children.items())
+#                 n_children = len(children_items)
+                
+#                 if self.use_numba and n_children > 5:
+#                     # Extract to arrays for Numba
+#                     visits = np.empty(n_children, dtype=np.float64)
+#                     values = np.empty(n_children, dtype=np.float64)
+#                     priors = np.empty(n_children, dtype=np.float64)
+#                     vloss = np.zeros(n_children, dtype=np.float64)  # 0 in sequential
+#                     actions_list = []
+                    
+#                     for i, (action, child) in enumerate(children_items):
+#                         visits[i] = child.visit_count
+#                         values[i] = child.total_value
+#                         priors[i] = child.prior
+#                         actions_list.append(action)
+                    
+#                     best_idx = _ucb_select_numba(visits, values, priors, vloss, c_puct, node.visit_count)
+#                     best_action = actions_list[best_idx]
+#                 else:
+#                     # Python fallback for small nodes
+#                     best_score = -float('inf')
+#                     best_action = None
+#                     parent_visits = node.visit_count
+                    
+#                     for action, child in children_items:
+#                         n = child.visit_count
+#                         q = child.total_value / n if n > 0 else 0.0
+#                         u = c_puct * child.prior * np.sqrt(parent_visits) / (1 + n)
+#                         score = q + u
+#                         if score > best_score:
+#                             best_score = score
+#                             best_action = action
+                
+#                 # Apply action (toggle returns bool)
+#                 if not toggle(*best_action):
+#                     break
+                
+#                 undo_stack.append(best_action)
+#                 path.append(node)
+#                 node = node.children[best_action]
+            
+#             path.append(node)  # Add leaf to path
+            
+#             # EXPANSION & EVALUATION
+#             if not node.children:
+#                 # Evaluate current state (work_state is already at leaf)
+#                 policies, values = evaluator.evaluate([work_state], [head_id])
+#                 self._expand_node(node, work_state, policies[0], values[0])
+#                 value = values[0]
+#             else:
+#                 # Shouldn't happen often with proper MCTS, but fetch cached value
+#                 cached = self._policy_cache.get(work_state.get_hash())
+#                 value = cached[1] if cached else 0.0
+            
+#             # BACKUP: Update statistics
+#             for n in path:
+#                 n.visit_count += 1
+#                 n.total_value += value
+            
+#             # BACKTRACK: Undo all actions to restore root state
+#             for u, v in reversed(undo_stack):
+#                 toggle(u, v)
+    
+#     def _search_parallel(self, root_state: Any, evaluator: Evaluator, 
+#                         num_simulations: int, num_threads: int):
+#         """Original parallel implementation (kept for thread safety)."""
+#         batch_size = max(8, num_threads * 2)
+#         remaining = num_simulations
+        
+#         while remaining > 0:
+#             current_batch = min(batch_size, remaining)
+#             self._simulate_batch_optimized(root_state, evaluator, current_batch, num_threads)
+#             remaining -= current_batch
+    
+#     def _simulate_batch_optimized(self, root_state: Any, evaluator: Evaluator,
+#                                   batch_size: int, num_threads: int):
+#         """Optimized batch processing."""
+#         # Collect leaves with virtual loss
+#         leaf_data = []
+#         for _ in range(batch_size):
+#             node, path, selected = self._select_to_leaf_locked()
+#             leaf_data.append((node, path, selected))
+        
+#         if not leaf_data:
+#             return
+        
+#         # Reconstruct states (unavoidable in parallel mode)
+#         states = []
+#         for node, _, _ in leaf_data:
+#             # Optimized reconstruction without building intermediate lists
+#             state = self._reconstruct_state_fast(node, root_state)
+#             states.append(state)
+        
+#         head_ids = [self.head_id] * len(states)
+#         policies, values = evaluator.evaluate(states, head_ids)
+        
+#         if batch_size <= 4 or num_threads == 1:
+#             for (node, path, selected_children), policy, value in zip(leaf_data, policies, values):
+#                 self._backup_and_expand(node, path, selected_children, policy, value)
+#         else:
+#             executor = self._get_executor(num_threads)
+#             futures = [
+#                 executor.submit(self._backup_and_expand, node, path, selected, pol, val)
+#                 for (node, path, selected), pol, val in zip(leaf_data, policies, values)
+#             ]
+#             for f in futures:
+#                 f.result()
+    
+#     def _reconstruct_state_fast(self, node: MCTSNode, root_state: Any) -> Any:
+#         """Iterative state reconstruction without recursion."""
+#         if node._state_cache is not None:
+#             return node._state_cache
+        
+#         # Build path iteratively
+#         path = []
+#         current = node
+#         while current.parent is not None:
+#             path.append(current.action)
+#             current = current.parent
+        
+#         # Apply actions
+#         state = root_state.copy()
+#         toggle = state.toggle_edge
+#         for action in reversed(path):
+#             toggle(*action)
+        
+#         # Optionally cache (trade memory for time)
+#         # node._state_cache = state  # Skip to save memory in parallel mode
+#         return state
+    
+#     def _select_to_leaf_locked(self) -> Tuple[MCTSNode, List[MCTSNode], List[MCTSNode]]:
+#         node = self.root
+#         path = [node]
+#         selected_children = []
+#         vl_val = self.virtual_loss_value
+        
+#         while True:
+#             children = node.children
+#             if not children:
+#                 break
+            
+#             action, child = self._select_child_optimized(node)
+            
+#             with self._lock:
+#                 child.virtual_loss += vl_val
+            
+#             selected_children.append(child)
+#             node = child
+#             path.append(node)
+        
+#         return node, path, selected_children
+    
+#     def _select_child_optimized(self, node: MCTSNode) -> Tuple[Tuple[int, int], MCTSNode]:
+#         """Inline UCB calculation."""
+#         best_score = -float('inf')
+#         best_action = None
+#         best_child = None
+#         c_puct = self.c_puct
+#         parent_visits = node.visit_count
+        
+#         for action, child in node.children.items():
+#             n = child.visit_count + child.virtual_loss
+#             q = (child.total_value - child.virtual_loss) / n if n > 0 else 0.0
+#             u = c_puct * child.prior * np.sqrt(parent_visits) / (1 + n)
+#             score = q + u
+            
+#             if score > best_score:
+#                 best_score = score
+#                 best_action = action
+#                 best_child = child
+        
+#         return best_action, best_child
+    
+#     def _backup_and_expand(self, node: MCTSNode, path: List[MCTSNode], 
+#                           selected_children: List[MCTSNode], 
+#                           logits: np.ndarray, value: float):
+#         state = node._state_cache
+#         if state is None:
+#             return
+        
+#         self._expand_node(node, state, logits, value)
+        
+#         with self._lock:
+#             for n in path:
+#                 n.visit_count += 1
+#                 n.total_value += value
+            
+#             for child in selected_children:
+#                 child.virtual_loss = max(0, child.virtual_loss - self.virtual_loss_value)
+    
+#     def _expand_node(self, node: MCTSNode, state: Any, 
+#                     logits: np.ndarray, value: float):
+#         cache_key = state.get_hash()
+        
+#         cached = self._policy_cache.get(cache_key)
+#         if cached is not None:
+#             priors = cached[0]
+#             valid_mask = self._valid_cache.get(cache_key)
+#             if valid_mask is None:
+#                 valid_mask = self._get_valid_mask_fast(state)
+#                 self._valid_cache.put(cache_key, valid_mask)
+#         else:
+#             valid_mask = self._valid_cache.get(cache_key)
+#             if valid_mask is None:
+#                 valid_mask = self._get_valid_mask_fast(state)
+#                 self._valid_cache.put(cache_key, valid_mask)
+            
+#             masked_logits = logits.copy()
+#             masked_logits[~valid_mask] = -1e9
+#             priors = self._softmax(masked_logits)
+            
+#             if node == self.root:
+#                 if self._root_noise is None or self._root_hash != cache_key:
+#                     valid_indices = np.where(valid_mask)[0]
+#                     self._root_noise = np.zeros(self.n_actions)
+#                     if len(valid_indices) > 0:
+#                         noise_vals = np.random.dirichlet([self.dirichlet_alpha] * len(valid_indices))
+#                         self._root_noise[valid_indices] = noise_vals
+#                     self._root_hash = cache_key
+                
+#                 eps = self.dirichlet_epsilon
+#                 priors = (1 - eps) * priors + eps * self._root_noise
+            
+#             self._policy_cache.put(cache_key, (priors, value))
+        
+#         with self._expansion_lock:
+#             if not node.children:
+#                 valid_indices = np.where((priors > 1e-9) & valid_mask)[0]
+#                 if len(valid_indices) == 0:
+#                     return
+                
+#                 actions = self.actions
+#                 for idx in valid_indices:
+#                     action = actions[idx]
+#                     test_state = state.copy()
+#                     if test_state.toggle_edge(*action):
+#                         node.children[action] = MCTSNode(
+#                             state_hash=test_state.get_hash(),
+#                             parent=node,
+#                             action=action,
+#                             prior=priors[idx]
+#                         )
+    
+#     def _get_valid_mask_fast(self, state: Any) -> np.ndarray:
+#         """Vectorized valid mask computation."""
+#         n = self.n_actions
+#         mask = np.empty(n, dtype=bool)
+#         actions = self.actions
+#         nodes = state.nodes
+#         adj = state.adjacency
+#         is_valid_add = state.is_valid_add
+        
+#         for i in range(n):
+#             u, v = actions[i]
+#             u_node = nodes[u]
+#             v_node = nodes[v]
+#             if v_node in adj[u_node]:
+#                 mask[i] = True
+#             else:
+#                 mask[i] = is_valid_add(u, v)
+#         return mask
+    
+#     def _get_visit_distribution(self) -> np.ndarray:
+#         visits = np.zeros(self.n_actions, dtype=np.float32)
+#         action_map = self.action_to_idx
+#         root_children = self.root.children if self.root else {}
+        
+#         for action, child in root_children.items():
+#             idx = action_map.get(action)
+#             if idx is not None:
+#                 visits[idx] = child.visit_count
+        
+#         total = visits.sum()
+#         if total > 0:
+#             visits /= total
+#         return visits
+    
+#     def select_action(self, temperature: float = 1.0) -> Optional[Tuple[int, int]]:
+#         probs = self._get_visit_distribution()
+        
+#         if probs.sum() == 0:
+#             return None
+        
+#         if temperature == 0:
+#             idx = int(np.argmax(probs))
+#         else:
+#             probs = probs ** (1.0 / temperature)
+#             probs = probs / probs.sum()
+#             idx = np.random.choice(len(probs), p=probs)
+        
+#         return self.actions[idx]
+    
+#     def get_training_data(self) -> Dict[str, Any]:
+#         visits = self._get_visit_distribution()
+#         probs = visits[visits > 0]
+#         entropy = -np.sum(probs * np.log(probs + 1e-10)) if len(probs) > 0 else 0.0
+        
+#         root = self.root
+#         return {
+#             'visit_distribution': visits,
+#             'policy_entropy': float(entropy),
+#             'num_children': len(root.children) if root else 0,
+#             'total_visits': root.visit_count if root else 0
+#         }
+    
+#     @staticmethod
+#     def _softmax(x: np.ndarray) -> np.ndarray:
+#         max_x = np.max(x)
+#         exp_x = np.exp(x - max_x)
+#         return exp_x / exp_x.sum()

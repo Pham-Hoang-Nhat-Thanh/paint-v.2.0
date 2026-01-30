@@ -1,3 +1,4 @@
+import time
 from typing import List
 import numpy as np
 from training.replay_buffer import Experience
@@ -30,7 +31,12 @@ class SelfPlayEngine:
         trajectory = []
         
         for step in range(self.max_steps):
+            start = time.time()
+            print(f"  [SelfPlay] Step {step+1}/{self.max_steps}", end=' ')
+            search_start = time.time()
             visit_distributions = self.mcts.search(graph, self.num_simulations)
+            search_end = time.time()
+            print(f"(Search Time: {search_end - search_start:.2f}s)", end=' ')
             
             trajectory.append({
                 'graph': graph.copy(),
@@ -41,6 +47,8 @@ class SelfPlayEngine:
             temperature = self.temperature_schedule(step)
             actions = self.mcts.select_actions(temperature)
             graph = self.mcts.batched_commit(graph, actions)
+            end = time.time()
+            print(f"(Time: {end - start:.2f}s)")
         
         final_reward = self.reward_fn(graph)
         

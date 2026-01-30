@@ -4,26 +4,29 @@ from training.selfplay import SelfPlayEngine
 from training.replay_buffer import ReplayBuffer
 from training.trainer import AlphaZeroTrainer
 from training.loss import AlphaZeroLoss
-from mcts.main import NASGraph, MultiHeadMCTS
+from mcts.main import MultiHeadMCTS
 from training.evaluate import reward_function, ArchitectureEvaluator
+# from env.network import NASGraph
+from env.fast_network import NASGraph
+from env.partition import build_node_subsets
 
 
-def example_main():    
-    # Configuration
-    # Use MNIST-sized inputs and reasonable hidden size
-    n_input = 28 * 28  # 784
+def example_main():
+    n_input = 784
     n_hidden = 128
-    n_output = 10  # MNIST classes
+    n_output = 10
     n_nodes = n_input + n_hidden + n_output
 
-    # Define sensible node subsets for heads: split hidden nodes into chunks
-    n_heads = 4
-    chunk = n_hidden // n_heads
-    node_subsets = []
-    for i in range(n_heads):
-        start = n_input + i * chunk
-        end = n_input + (i + 1) * chunk if i < n_heads - 1 else n_input + n_hidden
-        node_subsets.append(list(range(start, end)))
+    # Build node subsets for partitioned MCTS
+    node_subsets = build_node_subsets(
+        n_input=n_input,
+        n_hidden=n_hidden,
+        n_output=n_output,
+        subset_size=32,
+        extra_overlap_subsets=10,
+        seed=42)
+    
+    print(f"Built {len(node_subsets)} node subsets for partitioned MCTS.")
     
     # Create network
     network = PolicyValueNet(
@@ -39,7 +42,7 @@ def example_main():
     mcts = MultiHeadMCTS(
         node_subsets=node_subsets,
         n_nodes=n_nodes,
-        num_threads=4,
+        num_threads=32,
         cache_size=10000
     )
     

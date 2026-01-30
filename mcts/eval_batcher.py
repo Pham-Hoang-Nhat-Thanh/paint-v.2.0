@@ -42,6 +42,14 @@ class AsyncBatchedEvaluator:
         for ev in events:
             ev.wait()
 
+        # If any worker produced an exception, re-raise it here with context
+        for r in responses:
+            if isinstance(r, tuple) and len(r) == 2:
+                tag = r[0]
+                if isinstance(tag, str) and tag == '__EXC__':
+                    # r[1] is the exception instance
+                    raise r[1]
+
         # Collect in original order
         policies = [r[0] for r in responses]
         values = [r[1] for r in responses]
@@ -65,17 +73,26 @@ class AsyncBatchedEvaluator:
             states = [item[0] for item in batch]
             head_ids = [item[1] for item in batch]
 
+
             try:
                 policies, values = self.underlying.evaluate(states, head_ids)
-            except Exception:
-                # On failure, set None and notify waiters to avoid deadlock
-                policies = [None] * len(batch)
-                values = [0.0] * len(batch)
+                exc = None
+            except Exception as e:
+                # Capture exception and propagate it back to callers to reveal root cause
+                policies = None
+                values = None
+                exc = e
 
             # Dispatch results back to callers
-            for (s, h, idx, responses, ev), p, v in zip(batch, policies, values):
-                responses[idx] = (p, v)
-                ev.set()
+            if policies is None:
+                # Underlying evaluator failed; notify callers with the exception
+                for (s, h, idx, responses, ev) in batch:
+                    responses[idx] = ('__EXC__', exc)
+                    ev.set()
+            else:
+                for (s, h, idx, responses, ev), p, v in zip(batch, policies, values):
+                    responses[idx] = (p, v)
+                    ev.set()
 
     def stop(self):
         self._running = False
