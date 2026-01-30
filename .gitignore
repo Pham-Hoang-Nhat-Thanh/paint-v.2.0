@@ -1,2 +1,7 @@
 MNIST/
 __pycache__/
+*.cpp
+*.so
+*.o
+*.c
+build/
