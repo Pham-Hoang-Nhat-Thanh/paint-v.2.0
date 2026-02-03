@@ -277,12 +277,7 @@ cdef class CythonNASGraph:
         return g
     
     def get_num_edges(self):
-        cdef int count = 0
-        cdef int i, j
-        for i in range(self.n_nodes):
-            for j in range(self.n_nodes):
-                count += self._adj_matrix[i, j]
-        return count
+        return int(np.sum(self._adj_matrix))
     
     def to_sparse_features(self):
         cdef int i, j

@@ -1,509 +1,684 @@
-# mcts_fast.pyx (Single-Step API for Cross-Head Batching)
+# mcts_fast.pyx (Synchronized State Evolution - Segfault Fixed)
 # cython: language_level=3, boundscheck=False, wraparound=False, cdivision=True
 # distutils: extra_compile_args = -O3 -march=native -ffast-math
 
-from libc.stdlib cimport malloc, free
+from libc.stdlib cimport malloc, free, calloc, realloc
 from libc.string cimport memcpy, memset
 from libc.math cimport sqrt, exp
 import numpy as np
 cimport numpy as cnp
-from env.network_fast cimport CythonNASGraph, uint8, int64
+from env.network_fast cimport CythonNASGraph, uint8
 
-cdef struct CNode:
+cdef struct CHeadActionStats:
     double visit_count
     double total_value  
     double prior
+    int virtual_loss
+
+cdef struct CNode:
     int parent
-    int* children       
+    int* children           
     int num_children
-    int capacity        
-    int action_id       
-    int virtual_loss     
+    int capacity
+    int* incoming_actions   
+    int depth
+    double visit_count      
+    double total_value      
+    CHeadActionStats** head_stats
 
 cdef class CMCTSTree:
     cdef CNode* nodes
     cdef int capacity
-    cdef public int size
-    cdef public int root_idx
+    cdef int size
+    cdef int root_idx
+    cdef int n_heads
+    cdef int* n_actions_per_head
     cdef double c_puct
     cdef int virtual_loss_val
     cdef bint _initialized
     
-    def __cinit__(self, int max_nodes=5000000):
+    def __cinit__(self, int max_nodes, int n_heads):
         self.capacity = max_nodes
-        self.nodes = <CNode*>malloc(max_nodes * sizeof(CNode))
-        if not self.nodes:
-            raise MemoryError(f"Failed to allocate {max_nodes} nodes")
-        memset(<void*>self.nodes, 0, max_nodes * sizeof(CNode))
+        self.n_heads = n_heads
+        self.nodes = NULL
         self.size = 0
         self.root_idx = -1
+        self.n_actions_per_head = NULL
         self.c_puct = 1.0
         self.virtual_loss_val = 3
         self._initialized = False
         
-    def __dealloc__(self):
-        if self.nodes:
-            self.clear()
-            free(self.nodes)
+        if max_nodes <= 0:
+            raise MemoryError("max_nodes must be positive")
+        if n_heads <= 0:
+            raise ValueError("n_heads must be positive")
             
-    cpdef void initialize(self, double c_puct=1.0, int virtual_loss=3) except *:
-        self.clear()
-        self.c_puct = c_puct
-        self.virtual_loss_val = virtual_loss
-        self.root_idx = self._create_node(-1, -1, 1.0)
-        self._initialized = True
+        self.nodes = <CNode*>calloc(max_nodes, sizeof(CNode))
+        if not self.nodes:
+            raise MemoryError(f"Failed to allocate {max_nodes} nodes")
         
-    cdef int _create_node(self, int parent, int action_id, double prior) noexcept nogil:
+    def __dealloc__(self):
+        cdef int i, h
+        if self.nodes:
+            for i in range(self.size):
+                if self.nodes[i].children:
+                    free(self.nodes[i].children)
+                if self.nodes[i].incoming_actions:
+                    free(self.nodes[i].incoming_actions)
+                if self.nodes[i].head_stats:
+                    for h in range(self.n_heads):
+                        if self.nodes[i].head_stats[h]:
+                            free(self.nodes[i].head_stats[h])
+                    free(self.nodes[i].head_stats)
+            free(self.nodes)
+            self.nodes = NULL
+        if self.n_actions_per_head:
+            free(self.n_actions_per_head)
+            self.n_actions_per_head = NULL
+    
+    cdef int _create_node(self, int parent, int* incoming_actions, int depth) noexcept nogil:
         if self.size >= self.capacity:
             return -1
+            
         cdef int idx = self.size
         cdef CNode* node = &self.nodes[idx]
-        node.visit_count = 0
-        node.total_value = 0.0
-        node.prior = prior
+        
         node.parent = parent
+        node.depth = depth
         node.children = NULL
         node.num_children = 0
         node.capacity = 0
-        node.action_id = action_id
-        node.virtual_loss = 0
+        node.visit_count = 0
+        node.total_value = 0.0
+        
+        if incoming_actions:
+            node.incoming_actions = <int*>malloc(self.n_heads * sizeof(int))
+            if not node.incoming_actions:
+                return -1
+            memcpy(node.incoming_actions, incoming_actions, self.n_heads * sizeof(int))
+        else:
+            node.incoming_actions = NULL
+            
+        node.head_stats = <CHeadActionStats**>calloc(self.n_heads, sizeof(CHeadActionStats*))
+        if not node.head_stats:
+            return -1
+            
+        cdef int h
+        for h in range(self.n_heads):
+            if self.n_actions_per_head and self.n_actions_per_head[h] > 0:
+                node.head_stats[h] = <CHeadActionStats*>calloc(self.n_actions_per_head[h], sizeof(CHeadActionStats))
+                if not node.head_stats[h]:
+                    return -1
+        
         self.size += 1
         return idx
         
+    cpdef void initialize(self, int[:] n_actions_per_head, double c_puct=1.0, int virtual_loss=3) except *:
+        if n_actions_per_head.shape[0] != self.n_heads:
+            raise ValueError("n_actions_per_head length must match n_heads")
+            
+        self.clear()
+        self.c_puct = c_puct
+        self.virtual_loss_val = virtual_loss
+        
+        cdef int h
+        self.n_actions_per_head = <int*>malloc(self.n_heads * sizeof(int))
+        if not self.n_actions_per_head:
+            raise MemoryError("Failed to allocate n_actions_per_head")
+            
+        for h in range(self.n_heads):
+            self.n_actions_per_head[h] = n_actions_per_head[h]
+        
+        self.root_idx = self._create_node(-1, NULL, 0)
+        if self.root_idx == -1:
+            raise MemoryError("Failed to create root node")
+        self._initialized = True
+        
     cpdef void clear(self) except *:
-        cdef int i
+        cdef int i, h
         for i in range(self.size):
-            if self.nodes[i].children != NULL:
+            if self.nodes[i].children:
                 free(self.nodes[i].children)
+                self.nodes[i].children = NULL
+            if self.nodes[i].incoming_actions:
+                free(self.nodes[i].incoming_actions)
+                self.nodes[i].incoming_actions = NULL
+            if self.nodes[i].head_stats:
+                for h in range(self.n_heads):
+                    if self.nodes[i].head_stats[h]:
+                        free(self.nodes[i].head_stats[h])
+                        self.nodes[i].head_stats[h] = NULL
+                free(self.nodes[i].head_stats)
+                self.nodes[i].head_stats = NULL
         self.size = 0
         self.root_idx = -1
         self._initialized = False
         
-    cdef int _select_and_apply_virtual_loss_nogil(self, int node_idx) noexcept nogil:
-        cdef CNode* node = &self.nodes[node_idx]
-        if node.num_children == 0:
+    cdef int _select_best_action_for_head_nogil(self, int node_idx, int head_id) noexcept nogil:
+        if node_idx < 0 or node_idx >= self.size:
             return -1
             
-        cdef double best_score = -1e9
-        cdef int best_idx = -1
-        cdef double q, u, score
-        cdef int i, child_idx
-        cdef CNode* child
-        cdef double parent_visits = node.visit_count
-        cdef double vl_total, n_eff
+        cdef CNode* node = &self.nodes[node_idx]
+        if not node.head_stats or not node.head_stats[head_id]:
+            return -1
+            
+        cdef CHeadActionStats* stats = node.head_stats[head_id]
+        cdef int n_actions = self.n_actions_per_head[head_id]
         
-        for i in range(node.num_children):
-            child_idx = node.children[i]
-            child = &self.nodes[child_idx]
-            vl_total = child.visit_count + child.virtual_loss
-            n_eff = vl_total if vl_total > 0 else 1.0
-            if child.visit_count == 0:
+        cdef double best_score = -1e9
+        cdef int best_action = 0
+        cdef double q, u, n_total
+        cdef int a
+        
+        cdef double parent_visits = node.visit_count
+        if parent_visits < 1.0:
+            parent_visits = 1.0
+        
+        for a in range(n_actions):
+            n_total = stats[a].visit_count + stats[a].virtual_loss
+            if n_total == 0.0:
                 q = 0.0
             else:
-                q = (child.total_value - child.virtual_loss * self.virtual_loss_val) / n_eff
-            u = self.c_puct * child.prior * sqrt(parent_visits) / (1.0 + vl_total)
-            score = q + u
-            if score > best_score:
-                best_score = score
-                best_idx = i
-                
-        if best_idx == -1:
+                q = (stats[a].total_value - stats[a].virtual_loss * self.virtual_loss_val) / n_total
+            
+            u = self.c_puct * stats[a].prior * sqrt(parent_visits) / (1.0 + n_total)
+            
+            if q + u > best_score:
+                best_score = q + u
+                best_action = a
+        
+        stats[best_action].virtual_loss += self.virtual_loss_val
+        return best_action
+        
+    cdef int _find_child_with_actions_nogil(self, int node_idx, int* actions) noexcept nogil:
+        if node_idx < 0 or node_idx >= self.size or not actions:
             return -1
             
-        child_idx = node.children[best_idx]
-        self.nodes[child_idx].virtual_loss += self.virtual_loss_val
-        return child_idx
-        
-    cdef void _backup_nogil(self, int leaf_idx, double value) noexcept nogil:
-        cdef int current = leaf_idx
-        cdef CNode* node
-        
-        while current != -1:
-            node = &self.nodes[current]
-            node.visit_count += 1
-            node.total_value += value
-            if node.virtual_loss >= self.virtual_loss_val:
-                node.virtual_loss -= self.virtual_loss_val
-            else:
-                node.virtual_loss = 0
-            current = node.parent
-            
-    cdef int _expand_nogil(self, int node_idx, int* action_ids, double* priors, int n) noexcept nogil:
         cdef CNode* node = &self.nodes[node_idx]
-        cdef int i, child_idx
+        cdef int i, j, child_idx
+        cdef bint match
         
-        if node.num_children > 0 or n == 0:
-            return 0
-            
-        node.children = <int*>malloc(n * sizeof(int))
-        if not node.children:
-            return -1
-            
-        node.capacity = n
-        node.num_children = n
-        
-        for i in range(n):
-            child_idx = self._create_node(node_idx, action_ids[i], priors[i])
-            if child_idx == -1:
-                return -1
-            node.children[i] = child_idx
-        return 0
-
-    cdef int _select_leaf_nogil(self, int* path_buffer, int max_depth) noexcept nogil:
-        """Select leaf and return its index. Stores path in buffer."""
-        cdef int current = self.root_idx
-        cdef int depth = 0
-        cdef int child_idx
-        
-        path_buffer[depth] = current
-        depth += 1
-        
-        while True:
-            if self.nodes[current].num_children == 0:
-                break
-            child_idx = self._select_and_apply_virtual_loss_nogil(current)
-            if child_idx == -1:
-                break
-            current = child_idx
-            if depth >= max_depth:
-                return -1
-            path_buffer[depth] = current
-            depth += 1
-        return current
-
-    cdef void _get_path_edges_nogil(self, int leaf_idx, int* path_buffer, int* out_edges, int* out_len, 
-                                    int* action_u, int* action_v) noexcept nogil:
-        """Reconstruct edge list from root to leaf."""
-        cdef int current = leaf_idx
-        cdef int depth = 0
-        cdef int action_id
-        
-        # Trace back to find depth
-        while current != self.root_idx and current != -1:
-            out_edges[depth] = current
-            depth += 1
-            current = self.nodes[current].parent
-        
-        # Reverse (edges stored leaf-to-root, need root-to-leaf)
-        cdef int i, temp
-        for i in range(depth // 2):
-            temp = out_edges[i]
-            out_edges[i] = out_edges[depth - 1 - i]
-            out_edges[depth - 1 - i] = temp
-        
-        out_len[0] = depth
-            
-    cpdef int get_node_visits(self, int node_idx) except -1:
-        if node_idx < 0 or node_idx >= self.size:
-            return -1
-        return <int>self.nodes[node_idx].visit_count
-        
-    cpdef int get_node_num_children(self, int node_idx) except -1:
-        if node_idx < 0 or node_idx >= self.size:
-            return -1
-        return self.nodes[node_idx].num_children
-    
-    cpdef double get_node_total_value(self, int node_idx) except? 0.0:
-        if node_idx < 0 or node_idx >= self.size:
-            raise IndexError("Invalid node index")
-        return self.nodes[node_idx].total_value
-        
-    cpdef int get_node_action_id(self, int node_idx) except -1:
-        if node_idx < 0 or node_idx >= self.size:
-            return -1
-        return self.nodes[node_idx].action_id
-        
-    cpdef int get_node_child(self, int node_idx, int child_rank) except -1:
-        if node_idx < 0 or node_idx >= self.size:
-            raise IndexError("Invalid node index")
-        cdef CNode* node = &self.nodes[node_idx]
-        if child_rank < 0 or child_rank >= node.num_children:
-            raise IndexError("Child rank out of bounds")
-        return node.children[child_rank]
-        
-    cpdef int get_node_virtual_loss(self, int node_idx) except -1:
-        if node_idx < 0 or node_idx >= self.size:
-            return -1
-        return self.nodes[node_idx].virtual_loss
-        
-    cpdef double get_node_q(self, int node_idx) except? 0.0:
-        if node_idx < 0 or node_idx >= self.size:
-            return 0.0
-        cdef CNode* node = &self.nodes[node_idx]
-        cdef double n = node.visit_count + node.virtual_loss
-        if n == 0:
-            return 0.0
-        return (node.total_value - node.virtual_loss) / n
-        
-    cpdef void get_visit_distribution(self, double[:] out_array, int node_idx=-1) except *:
-        if node_idx < 0:
-            node_idx = self.root_idx
-        if node_idx < 0 or node_idx >= self.size:
-            raise IndexError("Invalid node index")
-        cdef CNode* node = &self.nodes[node_idx]
-        cdef int i, child_idx, action_id
-        cdef double total = 0.0
-        cdef int out_size = out_array.shape[0]
-        
-        for i in range(out_size):
-            out_array[i] = 0.0
-            
         for i in range(node.num_children):
             child_idx = node.children[i]
-            action_id = self.nodes[child_idx].action_id
-            if 0 <= action_id < out_size:
-                out_array[action_id] = self.nodes[child_idx].visit_count
-                total += self.nodes[child_idx].visit_count
-                
-        if total > 0:
-            for i in range(out_size):
-                out_array[i] /= total
-                
-    cpdef int root_visits(self) except -1:
-        if self.size == 0 or self.root_idx < 0:
-            return 0
-        return <int>self.nodes[self.root_idx].visit_count
+            if child_idx < 0 or child_idx >= self.size:
+                continue
+            match = True
+            for j in range(self.n_heads):
+                if not self.nodes[child_idx].incoming_actions:
+                    match = False
+                    break
+                if self.nodes[child_idx].incoming_actions[j] != actions[j]:
+                    match = False
+                    break
+            if match:
+                return child_idx
+        return -1
         
-    cpdef int root_num_children(self) except -1:
-        if self.size == 0 or self.root_idx < 0:
-            return 0
-        return self.nodes[self.root_idx].num_children
+    cdef int _add_child_nogil(self, int parent_idx, int* actions) noexcept nogil:
+        if parent_idx < 0 or parent_idx >= self.size or not actions:
+            return -1
+            
+        cdef CNode* parent = &self.nodes[parent_idx]
+        cdef int new_cap
+        cdef int* new_children
+        
+        if parent.num_children >= parent.capacity:
+            if parent.capacity == 0:
+                new_cap = 4
+            else:
+                new_cap = parent.capacity * 2
+            new_children = <int*>realloc(parent.children, new_cap * sizeof(int))
+            if not new_children:
+                return -1
+            parent.children = new_children
+            parent.capacity = new_cap
+        
+        cdef int child_idx = self._create_node(parent_idx, actions, parent.depth + 1)
+        if child_idx == -1:
+            return -1
+            
+        parent.children[parent.num_children] = child_idx
+        parent.num_children += 1
+        return child_idx
+        
+    cdef void _backup_nogil(self, int leaf_idx, double value, int** path_actions, int path_len) noexcept nogil:
+        if leaf_idx < 0 or leaf_idx >= self.size:
+            return
+            
+        self.nodes[leaf_idx].visit_count += 1.0
+        self.nodes[leaf_idx].total_value += value
+        
+        cdef int current = leaf_idx
+        cdef CNode* node
+        cdef int step, h, action
+        
+        for step in range(path_len - 1, -1, -1):
+            current = self.nodes[current].parent
+            if current == -1:
+                break
+                
+            node = &self.nodes[current]
+            if not node.head_stats:
+                continue
+            
+            if step < path_len and path_actions and path_actions[step]:
+                for h in range(self.n_heads):
+                    if not node.head_stats[h]:
+                        continue
+                    action = path_actions[step][h]
+                    if action >= 0 and action < self.n_actions_per_head[h]:
+                        node.head_stats[h][action].visit_count += 1
+                        node.head_stats[h][action].total_value += value
+                        if node.head_stats[h][action].virtual_loss >= self.virtual_loss_val:
+                            node.head_stats[h][action].virtual_loss -= self.virtual_loss_val
 
 
 cdef class MCTSEngine:
-    cdef public CMCTSTree tree
-    cdef int n_actions
+    cdef CMCTSTree tree
+    cdef int n_heads
+    cdef int** action_u
+    cdef int** action_v
+    cdef int* n_actions
     cdef double c_puct
     cdef int virtual_loss
     cdef double dirichlet_alpha
     cdef double dirichlet_epsilon
-    
-    cdef int* action_u
-    cdef int* action_v
     cdef int max_depth
-    cdef double[:] _root_noise_cache
-    cdef bint _root_noise_computed
+    cdef bint _initialized
     
-    def __cinit__(self, int max_nodes, double c_puct, int virtual_loss, 
-                  int n_actions, double dirichlet_alpha=0.3, double dirichlet_epsilon=0.25):
-        self.tree = CMCTSTree(max_nodes)
-        self.tree.initialize(c_puct, virtual_loss)
-        self.n_actions = n_actions
+    def __cinit__(self, int max_nodes, int n_heads, double c_puct=1.0, 
+                  int virtual_loss=3, double dirichlet_alpha=0.3, 
+                  double dirichlet_epsilon=0.25):
+        if max_nodes <= 0 or n_heads <= 0:
+            raise ValueError("max_nodes and n_heads must be positive")
+            
+        self.n_heads = n_heads
+        self.tree = CMCTSTree(max_nodes, n_heads)
         self.c_puct = c_puct
         self.virtual_loss = virtual_loss
         self.dirichlet_alpha = dirichlet_alpha
         self.dirichlet_epsilon = dirichlet_epsilon
-        self.max_depth = 100
+        self.max_depth = 1000
         self.action_u = NULL
         self.action_v = NULL
-        self._root_noise_cache = np.zeros(n_actions, dtype=np.float64)
-        self._root_noise_computed = False
+        self.n_actions = NULL
+        self._initialized = False
     
     def __dealloc__(self):
+        cdef int h
         if self.action_u:
+            for h in range(self.n_heads):
+                if self.action_u[h]:
+                    free(self.action_u[h])
             free(self.action_u)
         if self.action_v:
+            for h in range(self.n_heads):
+                if self.action_v[h]:
+                    free(self.action_v[h])
             free(self.action_v)
+        if self.n_actions:
+            free(self.n_actions)
     
-    def set_action_space(self, actions):
-        cdef int n = len(actions)
-        if self.action_u:
-            free(self.action_u)
-            free(self.action_v)
-        self.action_u = <int*>malloc(n * sizeof(int))
-        self.action_v = <int*>malloc(n * sizeof(int))
-        self.n_actions = n
+    def initialize_tree(self, list n_actions_per_head):
+        if len(n_actions_per_head) != self.n_heads:
+            raise ValueError("Length mismatch")
+            
+        cdef int h
+        cdef int[:] arr = np.array(n_actions_per_head, dtype=np.int32)
+        self.tree.initialize(arr, self.c_puct, self.virtual_loss)
         
-        cdef int i, u, v
-        for i, (u, v) in enumerate(actions):
-            self.action_u[i] = u
-            self.action_v[i] = v
+        self.n_actions = <int*>malloc(self.n_heads * sizeof(int))
+        if not self.n_actions:
+            raise MemoryError("Failed to allocate n_actions")
+            
+        for h in range(self.n_heads):
+            self.n_actions[h] = n_actions_per_head[h]
+        self._initialized = True
     
-    def clear(self):
-        self.tree.clear()
-        self.tree.initialize(self.c_puct, self.virtual_loss)
-        self._root_noise_computed = False
-        memset(<void*>&self._root_noise_cache[0], 0, self.n_actions * sizeof(double))
+    def set_head_action_spaces(self, list action_spaces):
+        if len(action_spaces) != self.n_heads:
+            raise ValueError("action_spaces length must match n_heads")
+            
+        cdef int h, i, u, v, n
+        cdef list actions
+        
+        self.action_u = <int**>calloc(self.n_heads, sizeof(int*))
+        self.action_v = <int**>calloc(self.n_heads, sizeof(int*))
+        
+        if not self.action_u or not self.action_v:
+            raise MemoryError("Failed to allocate action space arrays")
+        
+        try:
+            for h in range(self.n_heads):
+                actions = action_spaces[h]
+                n = len(actions)
+                
+                self.action_u[h] = <int*>malloc(n * sizeof(int))
+                self.action_v[h] = <int*>malloc(n * sizeof(int))
+                
+                if not self.action_u[h] or not self.action_v[h]:
+                    raise MemoryError(f"Failed to allocate action space for head {h}")
+                
+                for i, (u, v) in enumerate(actions):
+                    self.action_u[h][i] = u
+                    self.action_v[h][i] = v
+        except Exception:
+            self._free_action_spaces()
+            raise
     
-    @property
-    def size(self):
-        return self.tree.size
+    cdef void _free_action_spaces(self) noexcept:
+        cdef int h
+        if self.action_u:
+            for h in range(self.n_heads):
+                if self.action_u[h]:
+                    free(self.action_u[h])
+                    self.action_u[h] = NULL
+            free(self.action_u)
+            self.action_u = NULL
+        if self.action_v:
+            for h in range(self.n_heads):
+                if self.action_v[h]:
+                    free(self.action_v[h])
+                    self.action_v[h] = NULL
+            free(self.action_v)
+            self.action_v = NULL
     
-    @property
-    def root_visits(self):
-        return self.tree.root_visits()
-    
-    @property
-    def root_num_children(self):
-        return self.tree.root_num_children()
-
-    cdef inline bint _is_valid_edge_c(self, uint8* adj, int n_nodes, int n_input, int n_hidden, int u, int v) noexcept nogil:
+    cdef inline bint _is_valid_edge_c(self, uint8* adj, int n, int u, int v, int n_input, int n_hidden) noexcept nogil:
         if u == v:
             return False
         if v < n_input:
             return False
         if u >= n_input + n_hidden:
             return False
-        if adj[u * n_nodes + v]:
+        if adj[u*n + v]:
             return False
         return True
     
+    cdef void _apply_actions_to_state_nogil(self, uint8* base_adj, uint8* out_adj, int n_nodes,
+                                           int* selected_actions, int n_input, int n_hidden) noexcept nogil:
+        if not base_adj or not out_adj or not selected_actions:
+            return
+        memcpy(out_adj, base_adj, n_nodes * n_nodes * sizeof(uint8))
+        cdef int h, a, u, v
+        for h in range(self.n_heads):
+            a = selected_actions[h]
+            if a >= 0 and a < self.n_actions[h]:
+                u = self.action_u[h][a]
+                v = self.action_v[h][a]
+                if u >= 0 and u < n_nodes and v >= 0 and v < n_nodes:
+                    if self._is_valid_edge_c(out_adj, n_nodes, u, v, n_input, n_hidden):
+                        out_adj[u * n_nodes + v] = 1
+    
     cdef void _softmax_nogil(self, double* x, int n) noexcept nogil:
+        if not x or n <= 0:
+            return
         cdef int i
         cdef double max_val = x[0]
         cdef double sum_val = 0.0
-        
         for i in range(1, n):
             if x[i] > max_val:
                 max_val = x[i]
-        
         for i in range(n):
             x[i] = exp(x[i] - max_val)
             sum_val += x[i]
-        
         if sum_val > 0:
             for i in range(n):
                 x[i] /= sum_val
 
-    def select_leaf(self, CythonNASGraph state):
-        """
-        Select a leaf node and return its info.
-        Returns: (leaf_idx, state_features_dict, is_root)
-        """
+    cpdef void search(self, CythonNASGraph state, object evaluator, int n_sims) except *:
+        if not self._initialized:
+            raise RuntimeError("Engine not initialized. Call initialize_tree() first.")
+        if not state:
+            raise ValueError("state is None")
+        if not evaluator:
+            raise ValueError("evaluator is None")
+        if n_sims <= 0:
+            return
+            
         cdef int n_nodes = state.n_nodes
         cdef int n_input = state.n_input
         cdef int n_hidden = state.n_hidden
-        cdef int n_total = n_nodes * n_nodes
         
         cdef uint8* base_adj = &state._adj_matrix[0, 0]
-        cdef uint8* temp_adj = <uint8*>malloc(n_total * sizeof(uint8))
+        cdef uint8* temp_adj = <uint8*>malloc(n_nodes * n_nodes * sizeof(uint8))
         if not temp_adj:
-            raise MemoryError()
+            raise MemoryError("Failed to allocate temp_adj")
         
-        cdef int* path_buffer = <int*>malloc(self.max_depth * sizeof(int))
-        if not path_buffer:
+        cdef int* selected_actions = <int*>malloc(self.n_heads * sizeof(int))
+        cdef int** path_actions = <int**>malloc(self.max_depth * sizeof(int*))
+        cdef int* path_nodes = <int*>malloc(self.max_depth * sizeof(int))
+        
+        if not selected_actions or not path_actions or not path_nodes:
             free(temp_adj)
-            raise MemoryError()
+            raise MemoryError("Failed to allocate path buffers")
         
-        cdef int leaf_idx
-        cdef bint is_root
+        cdef int sim, step, h, current_node, child_node, i
+        cdef bint is_new_node
+        cdef double value
         
-        try:
-            with nogil:
-                leaf_idx = self.tree._select_leaf_nogil(path_buffer, self.max_depth)
-                is_root = (leaf_idx == self.tree.root_idx)
-                
-                if leaf_idx == -1:
-                    with gil:
-                        raise RuntimeError("Selection failed")
-                
-                # Copy base state
-                memcpy(temp_adj, base_adj, n_total * sizeof(uint8))
-                
-                # Apply path
-                cdef int i, node_idx, action_id, u, v
-                node_idx = leaf_idx
-                while node_idx != self.tree.root_idx and node_idx != -1:
-                    action_id = self.tree.nodes[node_idx].action_id
-                    u = self.action_u[action_id]
-                    v = self.action_v[action_id]
-                    if u >= 0 and u < n_nodes and v >= 0 and v < n_nodes:
-                        temp_adj[u * n_nodes + v] = 1
-                    node_idx = self.tree.nodes[node_idx].parent
-            
-            # Create numpy view (with GIL)
-            adj_arr = np.asarray(<uint8[:n_total]>temp_adj).reshape((n_nodes, n_nodes))
-            
-            features = {
-                'adj': adj_arr,
-                'n_nodes': n_nodes,
-                'n_input': n_input,
-                'n_hidden': n_hidden,
-                'n_output': state.n_output
-            }
-            
-            return leaf_idx, features, is_root
-            
-        finally:
-            free(temp_adj)
-            free(path_buffer)
-
-    def expand_and_backup(self, int leaf_idx, np.ndarray[np.float64_t, ndim=1] policy, 
-                         double value, CythonNASGraph state, bint is_root=False):
-        """
-        Expand leaf with policy and backup value.
-        Sequential: tree is updated immediately.
-        """
-        cdef int n_nodes = state.n_nodes
-        cdef int n_input = state.n_input
-        cdef int n_hidden = state.n_hidden
-        
-        cdef int* valid_actions = <int*>malloc(self.n_actions * sizeof(int))
-        cdef double* valid_priors = <double*>malloc(self.n_actions * sizeof(double))
-        
-        if not valid_actions or not valid_priors:
-            raise MemoryError()
-        
-        cdef int valid_count = 0
-        cdef int u, v, i
-        cdef bint valid
-        
-        try:
-            # Get current state at leaf (need to reconstruct to check validity)
-            # For efficiency, we assume the caller provides state features from select_leaf
-            # But we need to check which actions are valid from the leaf state
-            
-            # Reconstruct leaf state temporarily
-            cdef uint8* base_adj = &state._adj_matrix[0, 0]
-            cdef int n_total = n_nodes * n_nodes
-            cdef uint8* temp_adj = <uint8*>malloc(n_total * sizeof(uint8))
-            if not temp_adj:
-                raise MemoryError()
-            
-            try:
-                # Reconstruct state by tracing path (simplified - in practice cache this)
-                # For now, assume we have access to the state features from select_leaf
-                # This is a placeholder - actual implementation needs proper state management
-                pass
-            finally:
+        for i in range(self.max_depth):
+            path_actions[i] = <int*>malloc(self.n_heads * sizeof(int))
+            if not path_actions[i]:
+                # Cleanup
+                for j in range(i):
+                    free(path_actions[j])
+                free(path_actions)
+                free(selected_actions)
+                free(path_nodes)
                 free(temp_adj)
-            
-            # For now, simplified: assume all actions in policy are valid candidates
-            # Filter validity
-            valid_count = 0
-            for i in range(self.n_actions):
-                u = self.action_u[i]
-                v = self.action_v[i]
-                # This is imperfect - we need the actual state at the leaf
-                # Assuming leaf state is provided or reconstructed
-                valid = True  # Placeholder - should check against leaf state
-                if valid:
-                    valid_actions[valid_count] = i
-                    valid_priors[valid_count] = policy[i]
-                    valid_count += 1
-            
-            with nogil:
-                if valid_count > 0:
-                    self._softmax_nogil(valid_priors, valid_count)
-                    self.tree._expand_nogil(leaf_idx, valid_actions, valid_priors, valid_count)
+                raise MemoryError("Failed to allocate path_actions[i]")
+        
+        try:
+            for sim in range(n_sims):
+                current_node = self.tree.root_idx
+                step = 0
+                is_new_node = False
                 
-                self.tree._backup_nogil(leaf_idx, value)
+                while step < self.max_depth:
+                    for h in range(self.n_heads):
+                        selected_actions[h] = self.tree._select_best_action_for_head_nogil(current_node, h)
+                        if selected_actions[h] == -1:
+                            selected_actions[h] = 0  # Fallback
+                        path_actions[step][h] = selected_actions[h]
+                    
+                    child_node = self.tree._find_child_with_actions_nogil(current_node, selected_actions)
+                    
+                    if child_node == -1:
+                        child_node = self.tree._add_child_nogil(current_node, selected_actions)
+                        if child_node == -1:
+                            break
+                        is_new_node = True
+                        path_nodes[step] = child_node
+                        step += 1
+                        break
+                    else:
+                        path_nodes[step] = child_node
+                        current_node = child_node
+                        step += 1
+                
+                if step == 0:
+                    continue  # Failed to expand
+                    
+                leaf_node = current_node if is_new_node else path_nodes[step-1]
+                
+                # Reconstruct state at leaf
+                if self.tree.nodes[leaf_node].incoming_actions:
+                    self._apply_actions_to_state_nogil(
+                        base_adj, temp_adj, n_nodes, 
+                        self.tree.nodes[leaf_node].incoming_actions,
+                        n_input, n_hidden
+                    )
+                else:
+                    memcpy(temp_adj, base_adj, n_nodes * n_nodes * sizeof(uint8))
+                
+                # Evaluation (GIL required)
+                adj_arr = np.asarray(<uint8[:n_nodes*n_nodes]>temp_adj).reshape(n_nodes, n_nodes)
+                features = {
+                    'adj': adj_arr,
+                    'n_nodes': n_nodes,
+                    'n_input': n_input,
+                    'n_hidden': n_hidden,
+                    'n_output': state.n_output
+                }
+                
+                policies, values = evaluator.evaluate([features], [0])
+                value = float(values[0])
+                
+                # Backup
+                self.tree._backup_nogil(leaf_node, value, path_actions, step)
+                    
         finally:
-            free(valid_actions)
-            free(valid_priors)
+            free(temp_adj)
+            free(selected_actions)
+            free(path_nodes)
+            for i in range(self.max_depth):
+                if path_actions[i]:
+                    free(path_actions[i])
+            free(path_actions)
+    
+    def get_visit_distribution_for_head(self, int head_id, double[:] out_array):
+        if head_id < 0 or head_id >= self.n_heads:
+            raise ValueError("Invalid head_id")
+        if not self._initialized:
+            raise RuntimeError("Not initialized")
+            
+        cdef int root = self.tree.root_idx
+        if root < 0 or root >= self.tree.size:
+            return
+            
+        if not self.tree.nodes[root].head_stats or not self.tree.nodes[root].head_stats[head_id]:
+            return
+            
+        cdef CHeadActionStats* stats = self.tree.nodes[root].head_stats[head_id]
+        cdef int a
+        cdef double total = 0.0
+        
+        for a in range(self.n_actions[head_id]):
+            out_array[a] = stats[a].visit_count
+            total += stats[a].visit_count
+        
+        if total > 0:
+            for a in range(self.n_actions[head_id]):
+                out_array[a] /= total
 
-    def node_visits(self, idx): 
-        return self.tree.get_node_visits(idx)
-    def node_virtual_loss(self, idx): 
-        return self.tree.get_node_virtual_loss(idx)
-    def node_total_value(self, idx): 
-        return self.tree.get_node_total_value(idx)
-    def node_q(self, idx): 
-        return self.tree.get_node_q(idx)
-    def node_action_id(self, idx): 
-        return self.tree.get_node_action_id(idx)
-    def root_child_idx(self, i): 
-        return self.tree.get_node_child(self.tree.root_idx, i)
+        # Proxy-compatible methods for Python wrapper access
 
-    cpdef void get_visit_distribution(self, double[:] out_array) except *:
-        self.tree.get_visit_distribution(out_array, -1)
+    def get_node_parent(self, int node_idx):
+        """Get parent node index."""
+        if node_idx < 0 or node_idx >= self.tree.size:
+            return -1
+        return self.tree.nodes[node_idx].parent
+    
+    def get_head_action_visits(self, int node_idx, int head_id, int action_idx):
+        """Get visit count for specific head/action at node."""
+        if node_idx < 0 or node_idx >= self.tree.size:
+            return 0
+        cdef CNode* node = &self.tree.nodes[node_idx]
+        if not node.head_stats or not node.head_stats[head_id]:
+            return 0
+        if action_idx < 0 or action_idx >= self.n_actions[head_id]:
+            return 0
+        return int(node.head_stats[head_id][action_idx].visit_count)
+    
+    def get_head_action_virtual_loss(self, int node_idx, int head_id, int action_idx):
+        """Get virtual loss for specific head/action at node."""
+        if node_idx < 0 or node_idx >= self.tree.size:
+            return 0
+        cdef CNode* node = &self.tree.nodes[node_idx]
+        if not node.head_stats or not node.head_stats[head_id]:
+            return 0
+        if action_idx < 0 or action_idx >= self.n_actions[head_id]:
+            return 0
+        return node.head_stats[head_id][action_idx].virtual_loss
+    
+    def get_head_action_total_value(self, int node_idx, int head_id, int action_idx):
+        """Get total value for specific head/action at node."""
+        if node_idx < 0 or node_idx >= self.tree.size:
+            return 0.0
+        cdef CNode* node = &self.tree.nodes[node_idx]
+        if not node.head_stats or not node.head_stats[head_id]:
+            return 0.0
+        if action_idx < 0 or action_idx >= self.n_actions[head_id]:
+            return 0.0
+        return node.head_stats[head_id][action_idx].total_value
+    
+    @property
+    def root_num_children(self):
+        if not self._initialized or self.tree.root_idx < 0:
+            return 0
+        return self.tree.nodes[self.tree.root_idx].num_children
+    
+    def root_child_idx(self, int i):
+        """Get the i-th child index of root."""
+        cdef int root = self.tree.root_idx
+        if root < 0 or i < 0 or i >= self.tree.nodes[root].num_children:
+            return -1
+        return self.tree.nodes[root].children[i]
+    
+    def get_node_child(self, int node_idx, int child_rank):
+        """Get child index by rank."""
+        if node_idx < 0 or node_idx >= self.tree.size:
+            return -1
+        cdef CNode* node = &self.tree.nodes[node_idx]
+        if child_rank < 0 or child_rank >= node.num_children:
+            return -1
+        return node.children[child_rank]
+    
+    def node_action_id(self, int node_idx):
+        """Get incoming action for head 0 (or -1 if root)."""
+        if node_idx < 0 or node_idx >= self.tree.size:
+            return -1
+        if self.tree.nodes[node_idx].incoming_actions:
+            return self.tree.nodes[node_idx].incoming_actions[0]  # Return first head's action
+        return -1
+    
+    def get_head_action_at_node(self, int node_idx, int head_id):
+        """Get the action head_id took to reach node_idx."""
+        if node_idx < 0 or node_idx >= self.tree.size:
+            return -1
+        if not self.tree.nodes[node_idx].incoming_actions:
+            return -1
+        if head_id < 0 or head_id >= self.n_heads:
+            return -1
+        return self.tree.nodes[node_idx].incoming_actions[head_id]
+    
+    def node_visits(self, int node_idx):
+        if node_idx < 0 or node_idx >= self.tree.size:
+            return 0
+        return int(self.tree.nodes[node_idx].visit_count)
+    
+    def node_virtual_loss(self, int node_idx):
+        # Virtual loss is per-head per-action, not per-node in this design
+        # Return 0 for node-level queries
+        return 0
+    
+    def node_total_value(self, int node_idx):
+        if node_idx < 0 or node_idx >= self.tree.size:
+            return 0.0
+        return self.tree.nodes[node_idx].total_value
+    
+    def node_q(self, int node_idx):
+        if node_idx < 0 or node_idx >= self.tree.size:
+            return 0.0
+        cdef CNode* node = &self.tree.nodes[node_idx]
+        if node.visit_count == 0:
+            return 0.0
+        return node.total_value / node.visit_count
+    
+    def root_num_children_for_head(self, int head_id):
+        """Get number of children at root (same for all heads in synchronized tree)."""
+        return self.root_num_children
+    
+    @property
+    def root_visits(self):
+        if not self._initialized or self.tree.root_idx < 0:
+            return 0
+        return int(self.tree.nodes[self.tree.root_idx].visit_count)
+    
+    @property
+    def size(self):
+        return self.tree.size
+    
+    @property
+    def root_idx(self):
+        return self.tree.root_idx

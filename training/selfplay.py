@@ -1,6 +1,7 @@
 import time
 from typing import List
 import numpy as np
+from tqdm import trange
 from training.replay_buffer import Experience
 
 
@@ -29,28 +30,41 @@ class SelfPlayEngine:
         """Generate one self-play episode."""
         graph = self.initial_graph_fn()
         trajectory = []
+        episode_terminated_early = False
         
-        for step in range(self.max_steps):
-            start = time.time()
-            print(f"  [SelfPlay] Step {step+1}/{self.max_steps}", end=' ')
-            search_start = time.time()
-            visit_distributions = self.mcts.search(graph, self.num_simulations)
-            search_end = time.time()
-            print(f"(Search Time: {search_end - search_start:.2f}s)", end=' ')
-            
-            trajectory.append({
-                'graph': graph.copy(),
-                'visits': visit_distributions,
-                'step': step
-            })
-            
-            temperature = self.temperature_schedule(step)
-            actions = self.mcts.select_actions(temperature)
-            graph = self.mcts.batched_commit(graph, actions)
-            end = time.time()
-            print(f"(Time: {end - start:.2f}s)")
+        with trange(self.max_steps, desc="[SelfPlay] Steps", unit="step") as pbar:
+            for step in pbar:
+                start = time.time()
+                search_start = time.time()
+                visit_distributions = self.mcts.search(graph, self.num_simulations)
+                search_end = time.time()
+
+                trajectory.append({
+                    'graph': graph.copy(),
+                    'visits': visit_distributions,
+                    'step': step
+                })
+
+                temperature = self.temperature_schedule(step)
+                actions = self.mcts.select_actions(temperature)
+                graph = self.mcts.batched_commit(graph, actions)
+                end = time.time()
+
+                pbar.set_postfix({'search_s': f"{search_end - search_start:.2f}", 'step_s': f"{end - start:.2f}"})
+                
+                # Check termination: if graph has 0 edges (except on first step)
+                if step > 0:
+                    num_edges = graph.get_num_edges()
+                    if num_edges == 0:
+                        episode_terminated_early = True
+                        pbar.close()
+                        break
         
-        final_reward = self.reward_fn(graph)
+        # Apply heavy penalization if episode terminated early with 0 edges
+        if episode_terminated_early:
+            final_reward = - 1000.0  # Heavy penalization
+        else:
+            final_reward = self.reward_fn(graph)
         
         experiences = [
             Experience(
@@ -67,13 +81,13 @@ class SelfPlayEngine:
     def generate_episodes(self, num_episodes: int) -> List[Experience]:
         """Generate multiple episodes."""
         all_experiences = []
-        
-        for i in range(num_episodes):
+
+        for i in trange(num_episodes, desc="[SelfPlay] Episodes", unit="ep"):
             episode = self.generate_episode()
             all_experiences.extend(episode)
-            
+
             if (i + 1) % 10 == 0:
                 avg_reward = np.mean([exp.final_reward for exp in episode])
                 print(f"Episode {i+1}/{num_episodes}, Avg Reward: {avg_reward:.3f}, Steps: {len(episode)}")
-        
+
         return all_experiences

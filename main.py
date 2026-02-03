@@ -71,7 +71,7 @@ def example_main():
         initial_graph_fn=lambda: NASGraph(n_input, n_hidden, n_output),
         reward_fn=reward_fn,
         max_steps=100,
-        num_simulations=10
+        num_simulations=80
     )
     
     # Replay buffer
