@@ -54,6 +54,22 @@ class BatchedEvaluator(Evaluator):
         return all_policies, all_values
 
 
+class NetworkEvaluator(Evaluator):
+    """
+    Optimized evaluator that calls predict_batch ONCE to get both policies and values.
+    This is the preferred evaluator for MCTS with neural network guidance.
+    """
+    def __init__(self, network):
+        self.network = network
+    
+    def evaluate(self, states: List[Any], head_ids: List[int]) -> Tuple[List[np.ndarray], List[float]]:
+        """
+        Single network call returns all head policies + values.
+        For synchronized MCTS, states typically has length 1.
+        """
+        return self.network.predict_batch(states, head_ids)
+
+
 class MultiHeadMCTS:
     def __init__(self, 
                  node_subsets: List[List[int]],
@@ -95,17 +111,25 @@ class MultiHeadMCTS:
                      policy_fn: Callable = None, 
                      value_fn: Callable = None,
                      evaluator: Evaluator = None,
+                     network = None,
                      batched: bool = False):
-        """Set the evaluator for neural network guidance."""
+        """
+        Set the evaluator for neural network guidance.
+        
+        Preferred: pass network directly for optimal single-call evaluation.
+        """
         if evaluator is not None:
             self.evaluator = evaluator
+        elif network is not None:
+            # Optimal: single predict_batch call for policies + values
+            self.evaluator = NetworkEvaluator(network)
         elif policy_fn is not None and value_fn is not None:
             if batched:
                 self.evaluator = BatchedEvaluator(policy_fn, value_fn)
             else:
                 self.evaluator = SimpleEvaluator(policy_fn, value_fn)
         else:
-            raise ValueError("Must provide evaluator or (policy_fn, value_fn)")
+            raise ValueError("Must provide evaluator, network, or (policy_fn, value_fn)")
     
     def search(self, state: Any, num_simulations: int) -> List[np.ndarray]:
         """

@@ -21,6 +21,7 @@ class GraphNeuralNetwork(nn.Module):
         
         self.input_neurons = input_neurons
         self.output_neurons = output_neurons
+        self._force_uniform_outputs = False
         
         # Create pruned copies
         self._adj = {n: set(children) for n, children in self.graph.adjacency.items()}
@@ -89,6 +90,11 @@ class GraphNeuralNetwork(nn.Module):
             for p in rev.get(cur, ()):
                 if p not in can_reach_outputs:
                     stack.append(p)
+
+        # Outputs not reachable from inputs: fall back to uniform output distribution
+        unreachable_outputs = [n for n in output_nodes if n not in reachable_from_inputs]
+        if unreachable_outputs:
+            self._force_uniform_outputs = True
 
         keep = reachable_from_inputs & can_reach_outputs
         keep.update(input_nodes)
@@ -182,6 +188,8 @@ class GraphNeuralNetwork(nn.Module):
         self.output_layer_local = []
         for pos in self.output_indices:
             if pos not in self.global_to_layer_local:
+                if self._force_uniform_outputs:
+                    continue
                 raise ValueError(f"Output position {pos} not found in any computed layer; layers may be incomplete")
             self.output_layer_local.append(self.global_to_layer_local[pos])
     
@@ -282,6 +290,17 @@ class GraphNeuralNetwork(nn.Module):
         :param input_tensor: [batch_size, num_inputs]
         :return: [batch_size, num_outputs]
         """
+        if getattr(self, '_force_uniform_outputs', False):
+            num_outputs = len(self.output_neurons)
+            if num_outputs <= 0:
+                return torch.zeros(input_tensor.shape[0], 0, device=input_tensor.device, dtype=input_tensor.dtype)
+            return torch.full(
+                (input_tensor.shape[0], num_outputs),
+                1.0 / num_outputs,
+                device=input_tensor.device,
+                dtype=input_tensor.dtype
+            )
+
         batch_size = input_tensor.shape[0]
         layer_output = input_tensor
         layer_outputs = [layer_output]
@@ -329,6 +348,13 @@ class GraphNeuralNetwork(nn.Module):
     
     def forward(self, input_dict: Dict[str, float]) -> Dict[str, torch.Tensor]:
         """Single sample forward pass (legacy compatibility)."""
+        if getattr(self, '_force_uniform_outputs', False):
+            num_outputs = len(self.output_neurons)
+            if num_outputs <= 0:
+                return {}
+            value = torch.tensor(1.0 / num_outputs, device=self.device)
+            return {name: value for name in self.output_neurons}
+
         # Build input tensor in same order as provided input_neurons
         input_tensor = torch.zeros(1, len(self.input_neurons), device=self.device)
         for i, name in enumerate(self.input_neurons):

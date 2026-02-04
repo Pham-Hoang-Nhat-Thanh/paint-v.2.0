@@ -3,6 +3,7 @@ from torch_geometric.data import Data, Batch
 from typing import List, Tuple
 import numpy as np
 import random
+import gc
 from collections import deque
 from dataclasses import dataclass
 
@@ -21,15 +22,31 @@ class ReplayBuffer:
     Optimized experience replay buffer.
     
     v2.0: Supports efficient batching with custom collate function.
+    v2.1: Memory-optimized with periodic cleanup and cache clearing.
     """
     
     def __init__(self, max_size: int = 100000, min_size: int = 1000):
         self.buffer = deque(maxlen=max_size)
         self.max_size = max_size
         self.min_size = min_size
+        self._add_count = 0
+        self._cleanup_interval = 1000  # Cleanup every N additions
     
     def add(self, experience: Experience):
+        # Clear graph caches before storing to reduce memory
+        if hasattr(experience.graph_state, '_reach_cache'):
+            experience.graph_state._reach_cache.clear()
+        if hasattr(experience.graph_state, '_pyg_tensors'):
+            experience.graph_state._pyg_tensors.clear()
+        if hasattr(experience.graph_state, '_invalidate_caches'):
+            experience.graph_state._invalidate_caches()
+        
         self.buffer.append(experience)
+        self._add_count += 1
+        
+        # Periodic cleanup
+        if self._add_count % self._cleanup_interval == 0:
+            gc.collect()
     
     def add_episode(self, episode: List[Experience]):
         for exp in episode:
@@ -90,3 +107,9 @@ class ReplayBuffer:
     
     def is_ready(self):
         return len(self.buffer) >= self.min_size
+    
+    def clear(self):
+        """Clear all experiences and force garbage collection."""
+        self.buffer.clear()
+        self._add_count = 0
+        gc.collect()

@@ -6,6 +6,10 @@ from typing import List
 class CommunicationHub(nn.Module):
     """
     Inter-head communication with residual connections and regularization.
+    
+    Optimized v3.0:
+    - Fast tensor operations for single-batch case
+    - Reduced list/loop overhead
     """
     
     def __init__(self, 
@@ -29,52 +33,44 @@ class CommunicationHub(nn.Module):
             batch_first=True
         )
         
-        # Post-attention processing with residual
-        self.post_attention = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(head_embed_dim * 2, head_embed_dim * 2),
-                nn.LayerNorm(head_embed_dim * 2),
-                nn.ReLU(),
-                nn.Dropout(dropout),
-                nn.Linear(head_embed_dim * 2, head_embed_dim),
-                nn.LayerNorm(head_embed_dim)
-            ) for _ in range(num_heads)
-        ])
+        # Simplified post-attention
+        self.post_attention = nn.Sequential(
+            nn.LayerNorm(head_embed_dim),
+            nn.Linear(head_embed_dim, head_embed_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout)
+        )
         
         self.dropout = nn.Dropout(dropout)
     
     def forward(self, head_embeddings: List[torch.Tensor]) -> List[torch.Tensor]:
         """
-        Args:
-            head_embeddings: List of [batch_size, head_embed_dim]
-        
-        Returns:
-            List of [batch_size, head_embed_dim] global contexts
+        Returns list of global contexts for API compatibility.
         """
-        # Pre-normalization
-        normed_embeddings = [self.pre_norm(emb) for emb in head_embeddings]
+        stacked = torch.stack(head_embeddings, dim=1)  # [batch, num_heads, dim]
+        result = self.forward_stacked(stacked)
+        return [result[:, i, :] for i in range(self.num_heads)]
+    
+    def forward_stacked(self, stacked: torch.Tensor) -> torch.Tensor:
+        """
+        Fast path operating on stacked tensor directly.
         
-        # Stack for attention
-        stacked = torch.stack(normed_embeddings, dim=1)  # [batch, num_heads, dim]
+        Args:
+            stacked: [batch, num_heads, dim]
+        Returns:
+            [batch, num_heads, dim]
+        """
+        normed = self.pre_norm(stacked)
         
-        # Cross-attention with residual
-        attended, _ = self.attention(stacked, stacked, stacked)
+        # Self-attention
+        attended, _ = self.attention(normed, normed, normed)
         attended = self.dropout(attended)
-        attended = attended + stacked  # Residual connection
+        attended = attended + normed
         
-        # Per-head global context
-        global_contexts = []
-        for i in range(self.num_heads):
-            # Combine local and global
-            local = head_embeddings[i]  # Original (not normed)
-            global_i = attended[:, i, :]
-            
-            combined = torch.cat([local, global_i], dim=-1)
-            
-            # Process with residual
-            context = self.post_attention[i](combined)
-            context = context + local  # Residual connection
-            
-            global_contexts.append(context)
+        # Post-attention (fused reshape)
+        batch_size = stacked.size(0)
+        attended_flat = attended.reshape(-1, self.head_embed_dim)
+        attended_processed = self.post_attention(attended_flat)
+        attended_processed = attended_processed.view(batch_size, self.num_heads, self.head_embed_dim)
         
-        return global_contexts
+        return attended_processed + attended

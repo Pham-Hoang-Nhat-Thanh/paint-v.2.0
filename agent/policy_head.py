@@ -16,6 +16,14 @@ class PolicyHead(nn.Module):
         
         self.num_actions = num_actions
         
+        # Fusion layer for combining local and global context
+        self.fusion = nn.Sequential(
+            nn.Linear(head_embed_dim * 2, head_embed_dim),
+            nn.LayerNorm(head_embed_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout)
+        )
+        
         # Input projection
         self.input_proj = nn.Sequential(
             nn.Linear(head_embed_dim, hidden_dim),
@@ -24,24 +32,22 @@ class PolicyHead(nn.Module):
             nn.Dropout(dropout)
         )
         
-        # Residual blocks
-        self.residual_block1 = nn.Sequential(
+        # Residual blocks (post-norm is more efficient)
+        self.residual_block1_fc = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim)
+            nn.Linear(hidden_dim, hidden_dim)
         )
+        self.residual_block1_norm = nn.LayerNorm(hidden_dim)
         
-        self.residual_block2 = nn.Sequential(
+        self.residual_block2_fc = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim)
+            nn.Linear(hidden_dim, hidden_dim)
         )
+        self.residual_block2_norm = nn.LayerNorm(hidden_dim)
         
         # Output projection
         self.output_proj = nn.Linear(hidden_dim, num_actions)
@@ -55,21 +61,23 @@ class PolicyHead(nn.Module):
         Returns:
             Logits [batch_size, num_actions]
         """
-        # Combine local and global
-        x = head_embedding + global_context
+        # Combine local and global via learned fusion
+        x = self.fusion(torch.cat([head_embedding, global_context], dim=-1))
         
         # Input projection
         x = self.input_proj(x)
         
-        # Residual block 1
+        # Residual block 1 (post-norm is more efficient)
         residual = x
-        x = self.residual_block1(x)
-        x = F.relu(x + residual)
+        x = self.residual_block1_fc(x)
+        x = self.residual_block1_norm(x + residual)
+        x = F.relu(x)
         
         # Residual block 2
         residual = x
-        x = self.residual_block2(x)
-        x = F.relu(x + residual)
+        x = self.residual_block2_fc(x)
+        x = self.residual_block2_norm(x + residual)
+        x = F.relu(x)
         
         # Output
         logits = self.output_proj(x)

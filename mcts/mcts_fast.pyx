@@ -242,9 +242,11 @@ cdef class CMCTSTree:
         return child_idx
         
     cdef void _backup_nogil(self, int leaf_idx, double value, int** path_actions, int path_len) noexcept nogil:
+        """Backup value through the path, updating visit counts and values."""
         if leaf_idx < 0 or leaf_idx >= self.size:
             return
-            
+        
+        # Update leaf node
         self.nodes[leaf_idx].visit_count += 1.0
         self.nodes[leaf_idx].total_value += value
         
@@ -252,16 +254,20 @@ cdef class CMCTSTree:
         cdef CNode* node
         cdef int step, h, action
         
+        # Walk up the path from leaf to root
         for step in range(path_len - 1, -1, -1):
             current = self.nodes[current].parent
             if current == -1:
                 break
-                
-            node = &self.nodes[current]
-            if not node.head_stats:
-                continue
             
-            if step < path_len and path_actions and path_actions[step]:
+            node = &self.nodes[current]
+            
+            # Update node-level visit count (used in UCB parent_visits)
+            node.visit_count += 1.0
+            node.total_value += value
+            
+            # Update per-head action stats
+            if node.head_stats and path_actions and path_actions[step]:
                 for h in range(self.n_heads):
                     if not node.head_stats[h]:
                         continue
@@ -424,6 +430,57 @@ cdef class MCTSEngine:
         if sum_val > 0:
             for i in range(n):
                 x[i] /= sum_val
+    
+    cdef void _compute_valid_mask_and_mask_policy_nogil(self, int head_id, uint8* adj, 
+                                                         int n_nodes, int n_input, int n_hidden,
+                                                         double* policy, double* valid_mask) noexcept nogil:
+        """Compute validity mask and mask invalid actions in policy (set to -1e9)."""
+        cdef int a, u, v, n_act
+        n_act = self.n_actions[head_id]
+        for a in range(n_act):
+            u = self.action_u[head_id][a]
+            v = self.action_v[head_id][a]
+            if self._is_valid_edge_c(adj, n_nodes, u, v, n_input, n_hidden):
+                valid_mask[a] = 1.0
+            else:
+                valid_mask[a] = 0.0
+                policy[a] = -1e9
+    
+    cdef void _apply_softmax_to_policy_nogil(self, double* policy, int n) noexcept nogil:
+        """Apply softmax to policy array in-place."""
+        cdef int i
+        cdef double max_val, sum_val
+        if n <= 0:
+            return
+        max_val = policy[0]
+        for i in range(1, n):
+            if policy[i] > max_val:
+                max_val = policy[i]
+        sum_val = 0.0
+        for i in range(n):
+            policy[i] = exp(policy[i] - max_val)
+            sum_val += policy[i]
+        if sum_val > 1e-8:
+            for i in range(n):
+                policy[i] /= sum_val
+
+    cdef void _reconstruct_state_along_path_nogil(self, uint8* base_adj, uint8* out_adj, 
+                                                    int n_nodes, int n_input, int n_hidden,
+                                                    int** path_actions, int path_len) noexcept nogil:
+        """Reconstruct state by applying all actions along the path from root."""
+        memcpy(out_adj, base_adj, n_nodes * n_nodes * sizeof(uint8))
+        cdef int step, h, a, u, v
+        for step in range(path_len):
+            if not path_actions[step]:
+                continue
+            for h in range(self.n_heads):
+                a = path_actions[step][h]
+                if a >= 0 and a < self.n_actions[h]:
+                    u = self.action_u[h][a]
+                    v = self.action_v[h][a]
+                    if u >= 0 and u < n_nodes and v >= 0 and v < n_nodes:
+                        if self._is_valid_edge_c(out_adj, n_nodes, u, v, n_input, n_hidden):
+                            out_adj[u * n_nodes + v] = 1
 
     cpdef void search(self, CythonNASGraph state, object evaluator, int n_sims) except *:
         if not self._initialized:
@@ -452,9 +509,31 @@ cdef class MCTSEngine:
             free(temp_adj)
             raise MemoryError("Failed to allocate path buffers")
         
-        cdef int sim, step, h, current_node, child_node, i
+        cdef int sim, step, h, current_node, child_node, i, a, n_act
         cdef bint is_new_node
         cdef double value
+        cdef CNode* leaf_ptr
+        cdef CNode* root_node
+        cdef bint root_needs_priors
+        cdef double prior_sum
+        cdef int n_valid, noise_idx
+        
+        # Pre-allocate policy buffers ONCE (reused across all expansions)
+        cdef int max_actions = 0
+        for h in range(self.n_heads):
+            if self.n_actions[h] > max_actions:
+                max_actions = self.n_actions[h]
+        
+        cdef double* policy_buf = <double*>malloc(max_actions * sizeof(double))
+        cdef double* valid_buf = <double*>malloc(max_actions * sizeof(double))
+        if not policy_buf or not valid_buf:
+            if policy_buf: free(policy_buf)
+            if valid_buf: free(valid_buf)
+            free(temp_adj)
+            free(selected_actions)
+            free(path_actions)
+            free(path_nodes)
+            raise MemoryError("Failed to allocate policy buffers")
         
         for i in range(self.max_depth):
             path_actions[i] = <int*>malloc(self.n_heads * sizeof(int))
@@ -468,12 +547,76 @@ cdef class MCTSEngine:
                 free(temp_adj)
                 raise MemoryError("Failed to allocate path_actions[i]")
         
+        # Initialize root priors if not done yet (first simulation)
+        root_node = &self.tree.nodes[self.tree.root_idx]
+        root_needs_priors = True
+        if root_node.head_stats and root_node.head_stats[0]:
+            # Check if priors are already set (sum > 0)
+            prior_sum = 0.0
+            for a in range(self.n_actions[0]):
+                prior_sum += root_node.head_stats[0][a].prior
+            if prior_sum > 0.0:
+                root_needs_priors = False
+        
+        if root_needs_priors:
+            # Evaluate root state to get priors for all heads (ONE network call)
+            adj_arr = np.asarray(<uint8[:n_nodes*n_nodes]>base_adj).reshape(n_nodes, n_nodes).copy()
+            features = {
+                'adj': adj_arr,
+                'n_nodes': n_nodes,
+                'n_input': n_input,
+                'n_hidden': n_hidden,
+                'n_output': state.n_output
+            }
+            
+            # Single evaluation call - network returns all head policies for this state
+            policies, values = evaluator.evaluate([features], [0])
+            
+            # Set priors for each head with Dirichlet noise at root
+            for h in range(self.n_heads):
+                n_act = self.n_actions[h]
+                
+                # policies[h] is already a numpy array from predict_batch
+                policy_np = policies[h].ravel()
+                
+                if len(policy_np) >= n_act:
+                    for a in range(n_act):
+                        policy_buf[a] = policy_np[a]
+                else:
+                    for a in range(n_act):
+                        policy_buf[a] = 1.0 / n_act
+                
+                # Compute valid mask and mask policy in pure Cython
+                self._compute_valid_mask_and_mask_policy_nogil(h, base_adj, n_nodes, n_input, n_hidden, policy_buf, valid_buf)
+                
+                # Apply softmax in Cython
+                self._apply_softmax_to_policy_nogil(policy_buf, n_act)
+                
+                # Add Dirichlet noise at root (only to valid actions)
+                n_valid = 0
+                for a in range(n_act):
+                    if valid_buf[a] > 0:
+                        n_valid += 1
+                
+                if n_valid > 0:
+                    noise = np.random.dirichlet([self.dirichlet_alpha] * n_valid)
+                    noise_idx = 0
+                    for a in range(n_act):
+                        if valid_buf[a] > 0:
+                            policy_buf[a] = (1.0 - self.dirichlet_epsilon) * policy_buf[a] + self.dirichlet_epsilon * noise[noise_idx]
+                            noise_idx += 1
+                
+                # Copy priors to tree
+                for a in range(n_act):
+                    root_node.head_stats[h][a].prior = policy_buf[a]
+        
         try:
             for sim in range(n_sims):
                 current_node = self.tree.root_idx
                 step = 0
                 is_new_node = False
                 
+                # Selection: traverse tree until we find a node to expand
                 while step < self.max_depth:
                     for h in range(self.n_heads):
                         selected_actions[h] = self.tree._select_best_action_for_head_nogil(current_node, h)
@@ -484,6 +627,7 @@ cdef class MCTSEngine:
                     child_node = self.tree._find_child_with_actions_nogil(current_node, selected_actions)
                     
                     if child_node == -1:
+                        # Expansion: create new child node
                         child_node = self.tree._add_child_nogil(current_node, selected_actions)
                         if child_node == -1:
                             break
@@ -492,45 +636,80 @@ cdef class MCTSEngine:
                         step += 1
                         break
                     else:
+                        # Continue traversing existing tree
                         path_nodes[step] = child_node
                         current_node = child_node
                         step += 1
                 
                 if step == 0:
                     continue  # Failed to expand
-                    
-                leaf_node = current_node if is_new_node else path_nodes[step-1]
                 
-                # Reconstruct state at leaf
-                if self.tree.nodes[leaf_node].incoming_actions:
-                    self._apply_actions_to_state_nogil(
-                        base_adj, temp_adj, n_nodes, 
-                        self.tree.nodes[leaf_node].incoming_actions,
-                        n_input, n_hidden
+                # The leaf is always the last node in path_nodes
+                leaf_node = path_nodes[step - 1]
+                
+                # Only evaluate and set priors for NEW nodes
+                if is_new_node:
+                    # Reconstruct state at leaf by applying ALL actions along the path
+                    self._reconstruct_state_along_path_nogil(
+                        base_adj, temp_adj, n_nodes, n_input, n_hidden,
+                        path_actions, step
                     )
+                    
+                    # Single network call - returns policies for all heads + value
+                    adj_arr = np.asarray(<uint8[:n_nodes*n_nodes]>temp_adj).reshape(n_nodes, n_nodes).copy()
+                    features = {
+                        'adj': adj_arr,
+                        'n_nodes': n_nodes,
+                        'n_input': n_input,
+                        'n_hidden': n_hidden,
+                        'n_output': state.n_output
+                    }
+                    
+                    # Single evaluation call - network returns all head policies for this state
+                    policies, values = evaluator.evaluate([features], [0])
+                    value = float(values[0])
+                    
+                    # Set priors on the newly expanded node (no Dirichlet noise for non-root)
+                    leaf_ptr = &self.tree.nodes[leaf_node]
+                    for h in range(self.n_heads):
+                        n_act = self.n_actions[h]
+                        
+                        # policies[h] is already a numpy array from predict_batch
+                        policy_np = policies[h].ravel()
+                        
+                        # Copy to buffer (policies are already numpy float arrays)
+                        if len(policy_np) >= n_act:
+                            for a in range(n_act):
+                                policy_buf[a] = policy_np[a]
+                        else:
+                            # Uniform fallback
+                            for a in range(n_act):
+                                policy_buf[a] = 1.0 / n_act
+                        
+                        # Mask invalid actions and compute validity
+                        self._compute_valid_mask_and_mask_policy_nogil(h, temp_adj, n_nodes, n_input, n_hidden, policy_buf, valid_buf)
+                        
+                        # Apply softmax
+                        self._apply_softmax_to_policy_nogil(policy_buf, n_act)
+                        
+                        # Copy priors to tree
+                        for a in range(n_act):
+                            leaf_ptr.head_stats[h][a].prior = policy_buf[a]
                 else:
-                    memcpy(temp_adj, base_adj, n_nodes * n_nodes * sizeof(uint8))
+                    # For existing nodes, use the stored value (or a default)
+                    # In standard MCTS, we should not reach here often - 
+                    # this only happens if we traverse to a terminal state
+                    value = self.tree.nodes[leaf_node].total_value / max(1.0, self.tree.nodes[leaf_node].visit_count)
                 
-                # Evaluation (GIL required)
-                adj_arr = np.asarray(<uint8[:n_nodes*n_nodes]>temp_adj).reshape(n_nodes, n_nodes)
-                features = {
-                    'adj': adj_arr,
-                    'n_nodes': n_nodes,
-                    'n_input': n_input,
-                    'n_hidden': n_hidden,
-                    'n_output': state.n_output
-                }
-                
-                policies, values = evaluator.evaluate([features], [0])
-                value = float(values[0])
-                
-                # Backup
+                # Backup value through the path
                 self.tree._backup_nogil(leaf_node, value, path_actions, step)
                     
         finally:
             free(temp_adj)
             free(selected_actions)
             free(path_nodes)
+            free(policy_buf)
+            free(valid_buf)
             for i in range(self.max_depth):
                 if path_actions[i]:
                     free(path_actions[i])

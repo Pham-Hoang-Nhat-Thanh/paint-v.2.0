@@ -4,6 +4,7 @@ Version 4.0: Synchronized State Evolution (Single Shared Tree)
 All heads share one tree structure with per-head statistics at each node.
 """
 
+import gc
 import numpy as np
 from typing import Dict, List, Tuple, Optional, Any
 import threading
@@ -194,8 +195,11 @@ class CythonSynchronizedMCTS:
     
     def clear_caches(self):
         """Reset tree for new episode."""
-        self._engine.clear_tree()
+        # Re-initialize tree (clear is on the tree object, not engine)
+        self._engine.initialize_tree(self.n_actions_per_head)
         self.total_simulations = 0
+        # Clear any cached proxies
+        gc.collect()
 
 
 # Backward compatibility: HeadMCTS now refers to the synchronized system

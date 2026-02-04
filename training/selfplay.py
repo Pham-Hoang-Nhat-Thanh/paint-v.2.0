@@ -1,4 +1,5 @@
 import time
+import gc
 from typing import List
 import numpy as np
 from tqdm import trange
@@ -76,6 +77,15 @@ class SelfPlayEngine:
             for entry in trajectory
         ]
         
+        # Clear trajectory to free memory
+        trajectory.clear()
+        
+        # Clear MCTS tree after episode
+        if hasattr(self.mcts, 'clear_caches'):
+            self.mcts.clear_caches()
+        elif hasattr(self.mcts, 'reset_trees'):
+            self.mcts.reset_trees()
+        
         return experiences
     
     def generate_episodes(self, num_episodes: int) -> List[Experience]:
@@ -89,5 +99,9 @@ class SelfPlayEngine:
             if (i + 1) % 10 == 0:
                 avg_reward = np.mean([exp.final_reward for exp in episode])
                 print(f"Episode {i+1}/{num_episodes}, Avg Reward: {avg_reward:.3f}, Steps: {len(episode)}")
+            
+            # Periodic garbage collection every 5 episodes
+            if (i + 1) % 5 == 0:
+                gc.collect()
 
         return all_experiences

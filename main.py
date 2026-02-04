@@ -35,6 +35,8 @@ def example_main():
         node_embed_dim=128,
         head_embed_dim=128
     )
+
+    network.compile_for_inference()
     
     print(f"Network parameters: {sum(p.numel() for p in network.parameters()):,}")
     
@@ -46,12 +48,8 @@ def example_main():
         cache_size=10000
     )
     
-    # Set batched evaluator (OPTIMIZED)
-    mcts.set_evaluator(
-        policy_fn=lambda states, heads: network.predict_batch(states, heads)[0],
-        value_fn=lambda states: network.predict_batch(states, [0]*len(states))[1],
-        batched=True
-    )
+    # Set network evaluator (OPTIMIZED - single predict_batch call)
+    mcts.set_evaluator(network=network)
 
     evaluator = ArchitectureEvaluator(
         task='mnist',
@@ -73,6 +71,9 @@ def example_main():
         max_steps=100,
         num_simulations=80
     )
+    
+    # Store evaluator reference for cache clearing
+    selfplay.evaluator = evaluator
     
     # Replay buffer
     replay_buffer = ReplayBuffer(max_size=10000, min_size=100)

@@ -23,24 +23,24 @@ class ValueHead(nn.Module):
             nn.Dropout(dropout)
         )
         
-        # Residual blocks
-        self.residual_block1 = nn.Sequential(
+        # Residual block 1 (post-norm)
+        self.residual_block1_fc = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim)
+            nn.Linear(hidden_dim, hidden_dim)
         )
+        self.residual_block1_norm = nn.LayerNorm(hidden_dim)
         
-        self.residual_block2 = nn.Sequential(
+        # Residual block 2 with dimension reduction (post-norm)
+        self.residual_block2_fc = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.LayerNorm(hidden_dim // 2),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_dim // 2, hidden_dim // 2),
-            nn.LayerNorm(hidden_dim // 2)
+            nn.Linear(hidden_dim // 2, hidden_dim // 2)
         )
+        self.residual_block2_proj = nn.Linear(hidden_dim, hidden_dim // 2)  # Projection for residual
+        self.residual_block2_norm = nn.LayerNorm(hidden_dim // 2)
         
         # Output projection
         self.output_proj = nn.Sequential(
@@ -65,13 +65,16 @@ class ValueHead(nn.Module):
         # Input projection
         x = self.input_proj(graph_embedding)
         
-        # Residual block 1
+        # Residual block 1 (post-norm)
         residual = x
-        x = self.residual_block1(x)
-        x = F.relu(x + residual)
+        x = self.residual_block1_fc(x)
+        x = self.residual_block1_norm(x + residual)
+        x = F.relu(x)
         
-        # Residual block 2 (dimension change, no residual)
-        x = self.residual_block2(x)
+        # Residual block 2 (with projection for dimension change)
+        residual = self.residual_block2_proj(x)
+        x = self.residual_block2_fc(x)
+        x = self.residual_block2_norm(x + residual)
         x = F.relu(x)
         
         # Output

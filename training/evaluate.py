@@ -41,8 +41,10 @@ class ArchitectureEvaluator:
         self.device = device
         
         # Cache to avoid re-training identical architectures
+        # Limited size to prevent memory buildup
         self.cache_evaluations = cache_evaluations
         self.eval_cache = {}
+        self.max_cache_size = 500  # Limit cache entries
         
         # Load dataset once
         self._load_dataset()
@@ -248,8 +250,14 @@ class ArchitectureEvaluator:
             
             print(f"  [RESULT] Accuracy: {accuracy:.4f}, Time: {train_time:.1f}s")
             
-            # Cache result
+            # Cache result with size limit
             if self.cache_evaluations:
+                # Evict oldest entries if cache is full
+                if len(self.eval_cache) >= self.max_cache_size:
+                    # Remove ~20% of oldest entries
+                    keys_to_remove = list(self.eval_cache.keys())[:self.max_cache_size // 5]
+                    for k in keys_to_remove:
+                        del self.eval_cache[k]
                 self.eval_cache[graph_hash] = results
             
             return results
@@ -266,6 +274,15 @@ class ArchitectureEvaluator:
                 'num_params': 0,
                 'num_edges': nas_graph.get_num_edges()
             }
+    
+    def clear_cache(self):
+        """Clear evaluation cache to free memory."""
+        cache_size = len(self.eval_cache)
+        self.eval_cache.clear()
+        import gc
+        gc.collect()
+        if cache_size > 0:
+            print(f"  [CACHE] Cleared {cache_size} cached evaluations")
 
 
 def reward_function(evaluator: ArchitectureEvaluator, accuracy_threshold: float = 0.8):

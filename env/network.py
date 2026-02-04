@@ -1,5 +1,5 @@
 from collections import deque
-from typing import List, Tuple, Set, Optional
+from typing import List, Tuple
 import numpy as np
 from utils.lru_cache import LRUCache
 import torch
@@ -59,8 +59,8 @@ class NASGraph:
         self._init_zobrist()
         self.current_hash = 0
         
-        # Reachability cache
-        self._reach_cache = LRUCache(max_size=5000)
+        # Reachability cache - smaller size to reduce memory
+        self._reach_cache = LRUCache(max_size=1000)
         
         # Cached representations
         self._edges_np = None
@@ -99,7 +99,8 @@ class NASGraph:
         g.topo_order = self.topo_order.copy()
         g.position = self.position.copy()
         g.current_hash = self.current_hash
-        g._reach_cache = LRUCache(max_size=5000)
+        # Create fresh, smaller cache for copy (don't inherit parent's cache)
+        g._reach_cache = LRUCache(max_size=1000)
         g._edges_np = None
         g._pyg_data = None
         g._pyg_tensors = {}

@@ -28,8 +28,9 @@ class LRUCache:
             if key in self.cache:
                 self.cache.move_to_end(key)
             self.cache[key] = value
-            if len(self.cache) > self.max_size:
-                self.cache.popitem(last=False)  # Remove oldest
+            # Evict multiple entries when over capacity to reduce eviction frequency
+            while len(self.cache) > self.max_size:
+                self.cache.popitem(last=False)
     
     def clear(self):
         """Clear all entries."""
@@ -37,6 +38,11 @@ class LRUCache:
             self.cache.clear()
             self.hits = 0
             self.misses = 0
+    
+    def __len__(self):
+        """Return current cache size."""
+        with self.lock:
+            return len(self.cache)
     
     def stats(self):
         """Get cache statistics."""
