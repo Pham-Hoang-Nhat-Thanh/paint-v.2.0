@@ -45,33 +45,36 @@ class _CHeadChildProxy:
 class _CJointRootProxy:
     """
     Root proxy providing per-head views into the shared tree.
+    No caching: proxies are lightweight and tree state changes between calls.
     """
-    __slots__ = ('_engine', '_head_actions', '_children_cache')
+    __slots__ = ('_engine', '_head_actions')
     
     def __init__(self, engine, head_actions: List[List[Tuple[int, int]]]):
         self._engine = engine
         self._head_actions = head_actions  # List of action tuples per head
-        self._children_cache = {}  # (head_id, action) -> proxy
     
     def get_head_children(self, head_id: int) -> Dict[Tuple[int, int], '_CHeadChildProxy']:
-        """Get children dict for specific head at root."""
-        if head_id not in self._children_cache:
-            self._children_cache[head_id] = {}
-            root_idx = self._engine.root_idx
-            n_children = self._engine.root_num_children
-            
-            for i in range(n_children):
-                child_idx = self._engine.root_child_idx(i)
-                # Get the action this head took to reach this child
-                action_idx = self._engine.get_head_action_at_node(child_idx, head_id)
-                if action_idx >= 0 and action_idx < len(self._head_actions[head_id]):
-                    action = self._head_actions[head_id][action_idx]
-                    # Pass root_idx as parent, since that's where the action stats are stored
-                    self._children_cache[head_id][action] = _CHeadChildProxy(
-                        self._engine, root_idx, head_id, action_idx
-                    )
+        """Get children dict for specific head at root.
         
-        return self._children_cache[head_id]
+        No caching: the tree state changes between steps, so caching would
+        return stale data. Proxies are lightweight (just indices).
+        """
+        result = {}
+        root_idx = self._engine.root_idx
+        n_children = self._engine.root_num_children
+        
+        for i in range(n_children):
+            child_idx = self._engine.root_child_idx(i)
+            # Get the action this head took to reach this child
+            action_idx = self._engine.get_head_action_at_node(child_idx, head_id)
+            if action_idx >= 0 and action_idx < len(self._head_actions[head_id]):
+                action = self._head_actions[head_id][action_idx]
+                # Pass root_idx as parent, since that's where the action stats are stored
+                result[action] = _CHeadChildProxy(
+                    self._engine, root_idx, head_id, action_idx
+                )
+        
+        return result
 
 
 class CythonSynchronizedMCTS:
@@ -122,36 +125,99 @@ class CythonSynchronizedMCTS:
         # Threading lock for tree access (though tree updates are mostly in Cython)
         self._lock = threading.Lock()
         self.total_simulations = 0
+        
+        # Cached root proxy (invalidated on tree reset)
+        self._cached_root_proxy = None
+        
+        # Pre-allocated buffers for visit distributions (reused across searches)
+        self._visit_buffers = [np.zeros(n, dtype=np.float64) for n in self.n_actions_per_head]
+        self._result_buffers = [np.zeros(n, dtype=np.float32) for n in self.n_actions_per_head]
     
     @property
     def root(self) -> _CJointRootProxy:
         """Get root proxy providing per-head child access."""
-        return _CJointRootProxy(self._engine, self.head_actions)
+        # Reuse cached proxy if available, create new one only when needed
+        if self._cached_root_proxy is None:
+            self._cached_root_proxy = _CJointRootProxy(self._engine, self.head_actions)
+        return self._cached_root_proxy
     
-    def search(self, state: CythonNASGraph, evaluator, num_simulations: int) -> List[np.ndarray]:
+    # OLD:
+    # # # Run synchronized search with batched leaf evaluation.
+    # def search(self, state: CythonNASGraph, evaluator, num_simulations: int,
+    #            batch_size: int = 16) -> List[np.ndarray]:
+    #     """
+    #     Run synchronized search with batched leaf evaluation.
+
+    #     Args:
+    #         state: Initial graph state
+    #         evaluator: Network evaluator
+    #         num_simulations: Number of MCTS simulations
+    #         batch_size: Leaf nodes to evaluate per batch (8-32 recommended)
+    #                     - Higher = better GPU utilization
+    #                     - Lower = less memory, faster first results
+    #                     Recommended: 16 for most cases
+
+    #     Returns:
+    #         List of visit distributions, one per head
+    #     """
+    #     with self._lock:
+    #         # Use batched search for better GPU utilization
+    #         self._engine.search_batched(state, evaluator, num_simulations, batch_size)
+    #         self.total_simulations += num_simulations
+
+    #         # Extract per-head visit distributions using pre-allocated buffers
+    #         for h in range(self.n_heads):
+    #             # Zero the buffer and fill with visit counts
+    #             self._visit_buffers[h].fill(0.0)
+    #             self._engine.get_visit_distribution_for_head(h, self._visit_buffers[h])
+    #             # Convert to float32 in-place into result buffer
+    #             np.copyto(self._result_buffers[h], self._visit_buffers[h])
+
+    #         # Return copies (caller may modify)
+    #         return [buf.copy() for buf in self._result_buffers]
+
+    # NEW:
+    # # Run MCTS search and return both visit distributions AND root value estimate.
+    def search(self, state: CythonNASGraph, evaluator,  num_simulations: int,
+                        batch_size: int = 16) -> Dict:
         """
-        Run synchronized search: all heads move together through num_simulations joint trajectories.
-        Returns list of visit distributions, one per head.
+        Run MCTS search and return both visit distributions AND root value estimate.
+        
+        For TD(n) training: captures V(s) from network for bootstrap targets.
         """
         with self._lock:
-            self._engine.search(state, evaluator, num_simulations)
+            # Run standard batched search
+            self._engine.search_batched(state, evaluator, num_simulations, batch_size)
             self.total_simulations += num_simulations
             
-            # Extract per-head visit distributions from shared tree root
-            results = []
+            # Extract visit distributions
+            visit_dists = []
             for h in range(self.n_heads):
-                visits = np.zeros(self.n_actions_per_head[h], dtype=np.float64)
-                self._engine.get_visit_distribution_for_head(h, visits)
-                results.append(visits.astype(np.float32))
+                self._visit_buffers[h].fill(0.0)
+                self._engine.get_visit_distribution_for_head(h, self._visit_buffers[h])
+                np.copyto(self._result_buffers[h], self._visit_buffers[h])
+                visit_dists.append(self._result_buffers[h].copy())
             
-            return results
+            # ============================================
+            # NEW: Extract root value estimate for TD(n)
+            # ============================================
+            # The root's Q-value is the network's V(s) estimate (averaged over visits)
+            root_value = self._engine.node_q(self._engine.root_idx)
+            
+            return {
+                'visits': visit_dists,
+                'root_value': root_value,  # V(s) for TD(n) bootstrap
+                'root_visits': self._engine.root_visits
+            }
     
     def select_actions(self, temperature: float = 1.0) -> List[Optional[Tuple[int, int]]]:
         """Select action for each head based on their respective visit counts at root."""
         actions = []
         for h in range(self.n_heads):
-            visits = np.zeros(self.n_actions_per_head[h], dtype=np.float64)
-            self._engine.get_visit_distribution_for_head(h, visits)
+            # Reuse pre-allocated buffer
+            self._visit_buffers[h].fill(0.0)
+            self._engine.get_visit_distribution_for_head(h, self._visit_buffers[h])
+            visits = self._visit_buffers[h]
             
             if visits.sum() == 0:
                 actions.append(None)
@@ -172,8 +238,10 @@ class CythonSynchronizedMCTS:
         """Get training stats for all heads."""
         results = []
         for h in range(self.n_heads):
-            visits = np.zeros(self.n_actions_per_head[h], dtype=np.float64)
-            self._engine.get_visit_distribution_for_head(h, visits)
+            # Reuse pre-allocated buffer
+            self._visit_buffers[h].fill(0.0)
+            self._engine.get_visit_distribution_for_head(h, self._visit_buffers[h])
+            visits = self._visit_buffers[h]
             
             probs = visits[visits > 0]
             entropy = -np.sum(probs * np.log(probs + 1e-10)) if len(probs) > 0 else 0.0
@@ -195,11 +263,12 @@ class CythonSynchronizedMCTS:
     
     def clear_caches(self):
         """Reset tree for new episode."""
-        # Re-initialize tree (clear is on the tree object, not engine)
+        # Re-initialize tree (clears all nodes and stats)
         self._engine.initialize_tree(self.n_actions_per_head)
         self.total_simulations = 0
-        # Clear any cached proxies
-        gc.collect()
+        
+        # Invalidate root proxy cache
+        self._cached_root_proxy = None
 
 
 # Backward compatibility: HeadMCTS now refers to the synchronized system

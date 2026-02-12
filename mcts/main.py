@@ -131,22 +131,27 @@ class MultiHeadMCTS:
         else:
             raise ValueError("Must provide evaluator, network, or (policy_fn, value_fn)")
     
-    def search(self, state: Any, num_simulations: int) -> List[np.ndarray]:
+    def search(self, state: Any, num_simulations: int, batch_size: int = 16) -> List[np.ndarray]:
         """
-        Run synchronized MCTS search.
-        
+        Run synchronized MCTS search with batched leaf evaluation.
+
         All heads move in lockstep through the tree, maintaining per-head statistics
         at each node but sharing the same state evolution trajectory.
-        
+
+        Args:
+            state: Initial state to search from
+            num_simulations: Number of MCTS simulations to run
+            batch_size: Number of leaves to accumulate before batched evaluation (8-32 recommended)
+
         Returns:
             List of visit distributions (one per head) at the root
         """
         if self.evaluator is None:
             raise ValueError("Must call set_evaluator before search")
-        
-        # Single call to the synchronized engine
+
+        # Single call to the synchronized engine with batched evaluation
         # This runs the lockstep algorithm entirely in Cython
-        return self.engine.search(state, self.evaluator, num_simulations)
+        return self.engine.search(state, self.evaluator, num_simulations, batch_size)
     
     def select_actions(self, temperature: float = 1.0) -> List[Optional[Tuple[int, int]]]:
         """

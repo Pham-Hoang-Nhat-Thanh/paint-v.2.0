@@ -85,8 +85,8 @@ class ArchitectureEvaluator:
             raise ValueError(f"Unknown task: {self.task}")
         
         # Use subsets for faster evaluation
-        train_indices = torch.randperm(len(train_ds))[:self.train_subset_size]
-        val_indices = torch.randperm(len(val_ds))[:self.val_subset_size]
+        train_indices = torch.randperm(len(train_ds))[:self.train_subset_size] if self.train_subset_size != -1 else torch.arange(len(train_ds))
+        val_indices = torch.randperm(len(val_ds))[:self.val_subset_size] if self.val_subset_size != -1 else torch.arange(len(val_ds))
         
         train_subset = Subset(train_ds, train_indices)
         val_subset = Subset(val_ds, val_indices)
@@ -159,18 +159,39 @@ class ArchitectureEvaluator:
             - num_params: Number of trainable parameters
             - num_edges: Number of edges in architecture
         """
-        # Check cache
-        graph_hash = nas_graph.get_hash()
-        if self.cache_evaluations and graph_hash in self.eval_cache:
-            print(f"  [CACHE HIT] Using cached evaluation")
-            return self.eval_cache[graph_hash]
+        # Compute graph hash (needed for both caching and logging)
         
-        print(f"  [TRAINING] Evaluating architecture (hash: {graph_hash})")
+
+        # Check cache
+        if self.cache_evaluations:
+            graph_hash = nas_graph.get_hash()
+            if graph_hash in self.eval_cache:
+                print(f"  [CACHE HIT] Using cached evaluation")
+                return self.eval_cache[graph_hash]
+
+            print(f"  [TRAINING] Evaluating architecture (hash: {graph_hash})")
+        else:
+            print(f"  [TRAINING] Evaluating architecture")
         start_time = time.time()
         
         try:
             # Convert to trainable network
             model = self._graph_to_network(nas_graph)
+            
+            # Check if architecture is valid (outputs reachable from inputs)
+            if not model.is_trainable:
+                print(f"  [INVALID] Architecture has disconnected outputs - returning minimum reward")
+                results = {
+                    'accuracy': 0.0,
+                    'loss': float('inf'),
+                    'train_time': time.time() - start_time,
+                    'num_params': 0,
+                    'num_edges': nas_graph.get_num_edges(),
+                    'invalid': True
+                }
+                if self.cache_evaluations:
+                    self.eval_cache[graph_hash] = results
+                return results
 
             # Quick sanity check: ensure model output size matches evaluator classes
             try:
@@ -289,14 +310,18 @@ def reward_function(evaluator: ArchitectureEvaluator, accuracy_threshold: float 
     """
     Create a reward function that applies complexity penalties only when
     the architecture reaches `accuracy_threshold` accuracy.
+    
+    Returns values in [-1, 1] range to match value head's tanh output.
     """
-    def reward_function(graph) -> float:
+    def reward_fn(graph) -> float:
         """
         Reward based on actual architecture performance.
 
         Primary objective: accuracy.
         Complexity penalties (params, edges) are applied only when
         accuracy >= accuracy_threshold.
+        
+        Returns value in [-1, 1] range for tanh value head.
         """
         # Evaluate architecture
         results = evaluator.evaluate(graph)
@@ -305,7 +330,7 @@ def reward_function(evaluator: ArchitectureEvaluator, accuracy_threshold: float 
         num_params = results['num_params']
         num_edges = results['num_edges']
 
-        # Base reward is accuracy
+        # Base reward is accuracy (in [0, 1])
         reward = accuracy
 
         # Apply complexity penalties only when accuracy meets threshold
@@ -316,9 +341,12 @@ def reward_function(evaluator: ArchitectureEvaluator, accuracy_threshold: float 
             if num_edges > 0:
                 reward -= 0.001 * np.log(num_edges + 1)  # Small edge penalty
 
-        print(f"  [REWARD] Acc: {accuracy:.4f}, Params: {num_params}, Edges: {num_edges} → Reward: {reward:.4f}")
+        # Clip reward to [0, 1] range for sigmoid value head
+        normalized_reward = float(np.clip(reward, 0.0, 1.0))
 
-        return reward
+        print(f"  [REWARD] Acc: {accuracy:.4f}, Params: {num_params}, Edges: {num_edges} → Reward: {normalized_reward:.4f}")
 
-    return reward_function
+        return normalized_reward
+
+    return reward_fn
 

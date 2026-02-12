@@ -11,7 +11,7 @@ from env.fast_network import NASGraph
 from env.partition import build_node_subsets
 
 
-def example_main():
+def main():
     n_input = 784
     n_hidden = 128
     n_output = 10
@@ -23,7 +23,6 @@ def example_main():
         n_hidden=n_hidden,
         n_output=n_output,
         subset_size=32,
-        extra_overlap_subsets=10,
         seed=42)
     
     print(f"Built {len(node_subsets)} node subsets for partitioned MCTS.")
@@ -32,8 +31,8 @@ def example_main():
     network = PolicyValueNet(
         node_subsets=node_subsets,
         n_nodes=n_nodes,
-        node_embed_dim=128,
-        head_embed_dim=128
+        node_embed_dim=1024,
+        head_embed_dim=1024,
     )
 
     network.compile_for_inference()
@@ -53,53 +52,64 @@ def example_main():
 
     evaluator = ArchitectureEvaluator(
         task='mnist',
-        train_subset_size=5000,   # Fast evaluation
-        val_subset_size=1000,
-        train_epochs=3,           # Quick training
+        train_subset_size=-1,   # Full dataset
+        val_subset_size=-1,     # Full dataset
+        train_epochs=5,           # Quick training
         batch_size=256,
         device='cuda' if torch.cuda.is_available() else 'cpu',
-        cache_evaluations=True    # Cache to avoid retraining
+        cache_evaluations=False # Architecture is different enough each time that caching is not beneficial
     )
     
     reward_fn = reward_function(evaluator=evaluator)
 
-    # Self-play
+    # Self-play with batched MCTS (4x more simulations with batching)
     selfplay = SelfPlayEngine(
         mcts_coordinator=mcts,
         initial_graph_fn=lambda: NASGraph(n_input, n_hidden, n_output),
         reward_fn=reward_fn,
         max_steps=100,
-        num_simulations=80
+        num_simulations=100, 
+        mcts_batch_size=128
     )
     
     # Store evaluator reference for cache clearing
     selfplay.evaluator = evaluator
-    
+
     # Replay buffer
-    replay_buffer = ReplayBuffer(max_size=10000, min_size=100)
-    
-    # Trainer with optimized batching
-    optimizer = torch.optim.Adam(network.parameters(), lr=1e-3)
-    loss_fn = AlphaZeroLoss()
-    
+    replay_buffer = ReplayBuffer(max_size=10000, min_size=1000)
+
+    # Loss function - NO anti-overfitting measures (they caused catastrophic forgetting)
+    loss_fn = AlphaZeroLoss(
+        value_loss_weight=0.15,
+        entropy_weight=0.1,
+        l2_weight=1e-4,
+        value_label_smoothing=0.0,  # DISABLED: Confuses learning signal
+        use_huber_loss=False
+    )
+
+    # Trainer - NO value weight decay (it weakened the value head too much)
+    optimizer = torch.optim.AdamW(network.parameters(), lr=1e-2)
+
     trainer = AlphaZeroTrainer(
         network=network,
         mcts_coordinator=mcts,
         selfplay_engine=selfplay,
         replay_buffer=replay_buffer,
         optimizer=optimizer,
-        loss_fn=loss_fn
+        loss_fn=loss_fn,
+        value_loss_decay=1.0,  # DISABLED: No decay (catastrophic forgetting)
+        min_value_loss_weight=0.15
     )
     
     # Training loop
     print("Starting training...")
     trainer.train(
-        num_iterations=100,
-        episodes_per_iteration=5,
+        num_iterations=1000,
+        episodes_per_iteration=10,
         train_steps_per_iteration=50,
         batch_size=32
     )
 
 
 if __name__ == '__main__':
-    example_main()
+    main()

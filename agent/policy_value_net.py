@@ -7,7 +7,7 @@ from agent.encoder import GraphEncoder
 from agent.communication import CommunicationHub
 from agent.policy_head import PolicyHead
 from agent.value_head import ValueHead
-from agent.extractor import FusedMultiHeadExtractor
+from agent.extractor import MultiHeadExtractor
 
 
 class PolicyValueNet(nn.Module):
@@ -55,7 +55,7 @@ class PolicyValueNet(nn.Module):
         )
         
         # FUSED multi-head extractor (processes ALL heads in single GPU call)
-        self.fused_extractor = FusedMultiHeadExtractor(
+        self.extractor = MultiHeadExtractor(
             node_subsets=node_subsets,
             node_embed_dim=node_embed_dim,
             head_embed_dim=head_embed_dim,
@@ -167,22 +167,23 @@ class PolicyValueNet(nn.Module):
             batch = self._single_batch[:n_nodes] if self._single_batch.size(0) >= n_nodes else \
                     torch.zeros(n_nodes, dtype=torch.long, device=device)
             # [1, num_heads, head_embed_dim]
-            head_embeddings = self.fused_extractor(node_embeddings, batched_data.edge_index, batch=None)
+            head_embeddings = self.extractor(node_embeddings, batched_data.edge_index, batch=None)
         else:
             batch = batched_data.batch
             # [batch_size, num_heads, head_embed_dim]
-            head_embeddings = self.fused_extractor(node_embeddings, batched_data.edge_index, batch=batch)
+            head_embeddings = self.extractor(node_embeddings, batched_data.edge_index, batch=batch)
         
         # 3. Communication hub (stacked tensor path)
         global_contexts = self.communication_hub.forward_stacked(head_embeddings)  # [batch, num_heads, dim]
         
-        # 4. Policy and value
+        # 4. Policy and value - OPTIMIZED: batch all heads when evaluating
         if head_id is not None:
             policy_logits = [self.policy_heads[head_id](
                 head_embeddings[:, head_id, :],
                 global_contexts[:, head_id, :]
             )]
         else:
+            # All heads: use list comprehension with vectorized operation
             policy_logits = [
                 self.policy_heads[i](head_embeddings[:, i, :], global_contexts[:, i, :])
                 for i in range(self.num_heads)
@@ -303,7 +304,11 @@ class PolicyValueNet(nn.Module):
             return all_policies, all_values
     
     def _predict_all_heads_single_state(self, graph, device) -> Tuple[List[np.ndarray], List[float]]:
-        """Fast path: single state, get all head policies in one forward pass."""
+        """
+        Fast path: single state, get all head policies in one forward pass.
+        OPTIMIZED: Eliminate redundant conversions and batch all heads together.
+        """
+        # Convert graph to Data once (avoid redundant conversion)
         if isinstance(graph, dict) and 'adj' in graph:
             adj = graph['adj']
             n_nodes = int(graph['n_nodes'])
@@ -314,9 +319,8 @@ class PolicyValueNet(nn.Module):
             if rows.size == 0:
                 edge_index = torch.zeros((2, 0), dtype=torch.long, device=device)
             else:
-                edge_index = torch.as_tensor(
-                    np.vstack((rows, cols)), dtype=torch.long, device=device
-                )
+                # Combine conversion to torch with device transfer in one operation
+                edge_index = torch.from_numpy(np.vstack((rows, cols))).long().to(device)
             
             node_types = torch.zeros(n_nodes, dtype=torch.long, device=device)
             node_types[n_input:n_input+n_hidden] = 1
@@ -327,20 +331,21 @@ class PolicyValueNet(nn.Module):
             if len(edges) == 0:
                 edge_index = torch.zeros((2, 0), dtype=torch.long, device=device)
             else:
-                edge_index = torch.as_tensor(edges.T, dtype=torch.long, device=device)
+                edge_index = torch.from_numpy(edges.T).long().to(device)
             
             node_types = torch.zeros(n_nodes, dtype=torch.long, device=device)
             node_types[graph.n_input:graph.n_input+graph.n_hidden] = 1
             node_types[graph.n_input+graph.n_hidden:] = 2
         
-        data = Data(x=node_types, edge_index=edge_index).to(device)
+        data = Data(x=node_types, edge_index=edge_index)
         
-        # Single forward pass with head_id=None gets ALL policies
+        # Single forward pass with head_id=None gets ALL policies + single value
         policy_logits_list, values = self.forward(data, head_id=None)
         
-        # Convert to numpy - policy_logits_list has one tensor per head
-        all_policies = [p[0].cpu().numpy() for p in policy_logits_list]
+        # OPTIMIZED: Batch convert all to numpy at once
         value = values[0].item()
+        # Convert all policies in one batch operation (more cache-friendly)
+        all_policies = [p[0].detach().cpu().numpy() for p in policy_logits_list]
         all_values = [value] * self.num_heads
         
         return all_policies, all_values

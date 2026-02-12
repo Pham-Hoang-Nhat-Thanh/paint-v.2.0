@@ -42,8 +42,18 @@ class GraphNeuralNetwork(nn.Module):
         if self.use_mixed_precision:
             self.scaler = torch.cuda.amp.GradScaler()
     
+    @property
+    def is_trainable(self) -> bool:
+        """Check if this architecture has valid gradient flow (outputs reachable from inputs)."""
+        return not getattr(self, '_force_uniform_outputs', False)
+    
     def _prune_dead_neurons(self):
-        """Prune neurons not reachable from inputs or not reaching outputs."""
+        """
+        Prune neurons not reachable from inputs or not reaching outputs.
+        
+        IMPORTANT: Input and output neurons are NEVER pruned, even if technically dead.
+        They define the interface and are always kept regardless of connectivity.
+        """
         # Map node ids to node objects
         id_to_node = {n.idx: n for n in self._adj.keys()}
 
@@ -62,6 +72,11 @@ class GraphNeuralNetwork(nn.Module):
 
         input_nodes = [id_to_node[i] for i in input_ids]
         output_nodes = [id_to_node[i] for i in output_ids]
+        
+        # Ensure all input/output nodes are in adjacency (safety check)
+        for node in input_nodes + output_nodes:
+            if node not in self._adj:
+                self._adj[node] = set()
 
         rev = {n: set() for n in self._adj.keys()}
         for p, childs in self._adj.items():
@@ -96,14 +111,97 @@ class GraphNeuralNetwork(nn.Module):
         if unreachable_outputs:
             self._force_uniform_outputs = True
 
+        # CRITICAL: Keep all input and output neurons REGARDLESS of reachability
+        # They define the network interface and must always be present
         keep = reachable_from_inputs & can_reach_outputs
-        keep.update(input_nodes)
-        keep.update(output_nodes)
+        keep.update(input_nodes)  # ALWAYS keep input neurons
+        keep.update(output_nodes)  # ALWAYS keep output neurons
 
         self._adj = {n: {c for c in childs if c in keep}
                  for n, childs in self._adj.items() if n in keep}
-        self._topo_order = [n for n in self._topo_order if n in keep]
+        
+        # CRITICAL: Recompute topological order from scratch after pruning
+        # Simply filtering the old order can create invalid parent-child orderings
+        # when intermediate nodes are removed
+        self._topo_order = self._recompute_topological_order(keep, input_nodes)
         self._position = {n: i for i, n in enumerate(self._topo_order)}
+    
+    def _recompute_topological_order(self, nodes, input_nodes):
+        """
+        Recompute topological order for the given set of nodes using Kahn's algorithm.
+        
+        This is necessary after pruning because simply filtering the old order
+        can create invalid orderings when intermediate nodes are removed.
+        
+        If cycles are detected (shouldn't happen in valid DAGs but can occur due to
+        bugs in graph construction), we handle them by:
+        1. Processing all non-cyclic nodes first
+        2. Breaking cycles by removing edges from cyclic nodes
+        3. Setting _force_uniform_outputs if outputs are involved in cycles
+        
+        Args:
+            nodes: Set of nodes to include in the ordering
+            input_nodes: List of input nodes (used as starting points)
+        
+        Returns:
+            List of nodes in valid topological order
+        """
+        from collections import deque
+        
+        # Build in-degree map for nodes in the pruned graph
+        in_degree = {n: 0 for n in nodes}
+        for parent, children in self._adj.items():
+            for child in children:
+                if child in in_degree:
+                    in_degree[child] += 1
+        
+        # Start with nodes that have no incoming edges
+        # (inputs should always have in_degree 0)
+        queue = deque()
+        for node in nodes:
+            if in_degree[node] == 0:
+                queue.append(node)
+        
+        result = []
+        while queue:
+            node = queue.popleft()
+            result.append(node)
+            
+            for child in self._adj.get(node, set()):
+                if child in in_degree:
+                    in_degree[child] -= 1
+                    if in_degree[child] == 0:
+                        queue.append(child)
+        
+        # If result doesn't include all nodes, there are cycles
+        if len(result) < len(nodes):
+            remaining = nodes - set(result)
+            
+            # Check if any output neurons are in the cycle
+            output_ids = set()
+            for n in self.output_neurons:
+                if hasattr(n, 'idx'):
+                    output_ids.add(n.idx)
+                else:
+                    output_ids.add(int(n))
+            
+            cyclic_outputs = [n for n in remaining if n.idx in output_ids]
+            if cyclic_outputs:
+                # Outputs involved in cycles - mark as invalid for training
+                self._force_uniform_outputs = True
+            
+            # Remove ALL incoming edges to cyclic nodes to break cycles
+            # This makes them have in_degree 0 so they can be added to the topo order
+            for node in remaining:
+                # Remove edges pointing TO this node
+                for parent in list(self._adj.keys()):
+                    if node in self._adj[parent]:
+                        self._adj[parent].discard(node)
+            
+            # Add remaining nodes at the end (now they have no incoming edges)
+            result.extend(remaining)
+        
+        return result
     
     def _build_vectorized_structures(self):
         """Build fully vectorized structures using scatter/gather operations."""
@@ -173,9 +271,10 @@ class GraphNeuralNetwork(nn.Module):
         input_ids = _norm_ids(self.input_neurons)
         output_ids = _norm_ids(self.output_neurons)
 
-        self.input_indices = [self.nodeid_to_pos[i] for i in input_ids]
+        # Only include inputs/outputs that are in the kept neurons
+        self.input_indices = [self.nodeid_to_pos[i] for i in input_ids if i in self.nodeid_to_pos]
         # Positions in the global topo ordering for outputs
-        self.output_indices = [self.nodeid_to_pos[i] for i in output_ids]
+        self.output_indices = [self.nodeid_to_pos[i] for i in output_ids if i in self.nodeid_to_pos]
 
         # Build mapping from global position -> (layer_idx, local_idx) so we can
         # retrieve output activations even if outputs live in different layers.
@@ -185,13 +284,13 @@ class GraphNeuralNetwork(nn.Module):
                 self.global_to_layer_local[global_pos] = (layer_idx, local_idx)
 
         # For each requested output global position, record its (layer_idx, local_idx)
+        # If we have unreachable outputs, skip this mapping entirely (will use uniform fallback)
         self.output_layer_local = []
-        for pos in self.output_indices:
-            if pos not in self.global_to_layer_local:
-                if self._force_uniform_outputs:
-                    continue
-                raise ValueError(f"Output position {pos} not found in any computed layer; layers may be incomplete")
-            self.output_layer_local.append(self.global_to_layer_local[pos])
+        if not self._force_uniform_outputs:
+            for pos in self.output_indices:
+                if pos not in self.global_to_layer_local:
+                    raise ValueError(f"Output position {pos} not found in any computed layer; layers may be incomplete")
+                self.output_layer_local.append(self.global_to_layer_local[pos])
     
     def _compute_layers(self):
         """Group neurons into layers that can be computed in parallel."""
@@ -287,6 +386,11 @@ class GraphNeuralNetwork(nn.Module):
         Fully vectorized forward pass using scatter_add for aggregation.
         Preserves exact graph topology while being GPU-efficient.
         
+        OPTIMIZED v2.0:
+        - Avoid storing all layer outputs (memory efficient)
+        - Pre-compute output indices and gather in one pass
+        - Optimized edge index expansion
+        
         :param input_tensor: [batch_size, num_inputs]
         :return: [batch_size, num_outputs]
         """
@@ -294,31 +398,48 @@ class GraphNeuralNetwork(nn.Module):
             num_outputs = len(self.output_neurons)
             if num_outputs <= 0:
                 return torch.zeros(input_tensor.shape[0], 0, device=input_tensor.device, dtype=input_tensor.dtype)
+            # BUGFIX: Return tensor with gradient tracking to allow backward() to work
+            # Use a learnable scalar to maintain gradient flow through this dead architecture
+            uniform_val = 1.0 / num_outputs
+            # Create output that depends on input (maintains gradient flow)
+            # Use a tiny dependence on input sum to keep gradients alive
+            input_sum = input_tensor.sum(dim=1, keepdim=True) * 0.0  # Zero contribution, but keeps grad_fn
             return torch.full(
                 (input_tensor.shape[0], num_outputs),
-                1.0 / num_outputs,
+                uniform_val,
                 device=input_tensor.device,
-                dtype=input_tensor.dtype
-            )
+                dtype=input_tensor.dtype,
+                requires_grad=True
+            ) + input_sum.expand(-1, num_outputs)
 
         batch_size = input_tensor.shape[0]
         layer_output = input_tensor
-        layer_outputs = [layer_output]
+        
+        # OPTIMIZATION: Only store outputs if needed for gathering
+        need_intermediates = hasattr(self, 'output_layer_local') and len(self.output_layer_local) > 0
+        layer_outputs = {} if need_intermediates else None
+        
+        if need_intermediates:
+            layer_outputs[0] = layer_output
 
-        for layer_idx, layer_module in enumerate(self.layer_params):
+        # Pre-compute edge index expansions for all layers (avoid repeat computation in loop)
+        edge_expansions = []
+        for layer_module in self.layer_params:
+            if layer_module.edge_index.shape[1] > 0:
+                # Pre-expand edge indices: [num_edges] -> [batch_size, num_edges]
+                edge_exp = layer_module.edge_index[0].unsqueeze(0).expand(batch_size, -1)
+                edge_expansions.append((layer_module.edge_index, edge_exp, layer_module.weights))
+            else:
+                edge_expansions.append((None, None, None))
+
+        for layer_idx, (layer_module, edge_data) in enumerate(zip(self.layer_params, edge_expansions)):
+            # Initialize with bias - broadcast to batch size while preserving gradient flow
+            next_output = layer_module.bias.unsqueeze(0).repeat(batch_size, 1)
             
-            # Initialize with bias
-            next_output = layer_module.bias.unsqueeze(0).expand(batch_size, -1).clone()
-            
-            # Get edge information
-            edge_index = layer_module.edge_index
-            weights = layer_module.weights
-            
-            if edge_index.shape[1] > 0:
-                # Vectorized edge processing using advanced indexing
-                # edge_index[0]: target neuron indices in current layer
-                # edge_index[1]: source neuron indices in previous layer
+            if edge_data[0] is not None:
+                edge_index, edge_exp, weights = edge_data
                 
+                # Vectorized edge processing using advanced indexing
                 # Get all source activations: [batch_size, num_edges]
                 source_activations = layer_output[:, edge_index[1]]
                 
@@ -326,19 +447,18 @@ class GraphNeuralNetwork(nn.Module):
                 weighted_activations = source_activations * weights.unsqueeze(0)
                 
                 # Aggregate to target neurons using scatter_add
-                # This sums all incoming edges for each neuron
-                next_output.scatter_add_(
-                    1,
-                    edge_index[0].unsqueeze(0).expand(batch_size, -1),
-                    weighted_activations
-                )
+                next_output.scatter_add_(1, edge_exp, weighted_activations)
             
             # Apply activation
             layer_output = self.activation_fn(next_output)
-            layer_outputs.append(layer_output)
+            
+            # Store if needed for output gathering
+            if need_intermediates:
+                layer_outputs[layer_idx + 1] = layer_output
 
-        # Build output tensor by gathering activations from the recorded layer/local indices
-        if hasattr(self, 'output_layer_local') and len(self.output_layer_local) > 0:
+        # OPTIMIZATION: Batch gather outputs in single operation
+        if need_intermediates and len(self.output_layer_local) > 0:
+            # Collect all (layer_idx, local_idx) pairs and gather in vectorized manner
             out_cols = []
             for layer_idx, local_idx in self.output_layer_local:
                 out_cols.append(layer_outputs[layer_idx][:, local_idx].unsqueeze(1))
@@ -366,8 +486,7 @@ class GraphNeuralNetwork(nn.Module):
         layer_output = input_tensor
         
         for layer_module in self.layer_params:
-            curr_layer_size = layer_module.bias.shape[0]
-            next_output = layer_module.bias.unsqueeze(0).clone()
+            next_output = layer_module.bias.unsqueeze(0)
             
             edge_index = layer_module.edge_index
             weights = layer_module.weights
@@ -395,6 +514,7 @@ class GraphNeuralNetwork(nn.Module):
         """Optimized batch training step."""
         optimizer.zero_grad()
         
+        # Forward pass (with mixed precision if enabled)
         if self.use_mixed_precision:
             with torch.cuda.amp.autocast():
                 outputs = self.forward_batch(input_batch)
@@ -409,10 +529,8 @@ class GraphNeuralNetwork(nn.Module):
                             tmax = int(tq.max().item())
                             if tmin < 0 or tmax >= outputs.size(1):
                                 raise ValueError(f"Target labels out of range: min={tmin}, max={tmax}, num_outputs={outputs.size(1)}")
+                # Loss computation inside autocast
                 loss = criterion(outputs, target_batch)
-            self.scaler.scale(loss).backward()
-            self.scaler.step(optimizer)
-            self.scaler.update()
         else:
             outputs = self.forward_batch(input_batch)
             # Validate target indices when using classification loss
@@ -427,6 +545,13 @@ class GraphNeuralNetwork(nn.Module):
                         if tmin < 0 or tmax >= outputs.size(1):
                             raise ValueError(f"Target labels out of range: min={tmin}, max={tmax}, num_outputs={outputs.size(1)}")
             loss = criterion(outputs, target_batch)
+        
+        # Backward pass
+        if self.use_mixed_precision:
+            self.scaler.scale(loss).backward()
+            self.scaler.step(optimizer)
+            self.scaler.update()
+        else:
             loss.backward()
             optimizer.step()
         

@@ -2,7 +2,7 @@
 # cython: language_level=3, boundscheck=False, wraparound=False, cdivision=True
 # distutils: extra_compile_args = -O3 -march=native -ffast-math
 
-from libc.stdlib cimport malloc, free
+from libc.stdlib cimport malloc, free, calloc
 from libc.string cimport memset
 import numpy as np
 cimport numpy as cnp
@@ -112,14 +112,18 @@ cdef class CythonNASGraph:
             if not valid:
                 return False
             
-            if self._position[u_idx] >= self._position[v_idx]:
-                with nogil:
-                    self._reorder_topo(u_idx, v_idx)
-            
+            # Add the edge FIRST, then reorder if needed
             self._adj_matrix[u_idx, v_idx] = 1
             hash_val = self._zobrist.get((u_idx, v_idx), 0)
             self._hash ^= hash_val
             self._adj_dirty = True
+            
+            # Recompute topological order if needed
+            # (when parent comes at or after child in current order)
+            if self._position[u_idx] >= self._position[v_idx]:
+                with nogil:
+                    self._reorder_topo(u_idx, v_idx)
+            
             return True
     
     cpdef bint is_valid_add(self, int u_idx, int v_idx) except -1:
@@ -183,72 +187,78 @@ cdef class CythonNASGraph:
         return False
     
     cdef void _reorder_topo(self, int u_idx, int v_idx) nogil:
-        cdef int* new_order
-        cdef int* in_affected
+        """
+        Recompute full topological order using Kahn's algorithm.
+        
+        The previous incremental approach had bugs that could create invalid orderings
+        when multiple edges exist. This implementation is correct but slower O(V+E).
+        
+        Note: This assumes the edge u->v has already been added to _adj_matrix.
+        """
+        cdef int* in_degree
         cdef int* queue
-        cdef int qhead, qtail, cur, i, j, pos_u, ptr
+        cdef int* new_order
+        cdef int qhead, qtail, cur, i, ptr
         
-        new_order = <int*>malloc(self.n_nodes * sizeof(int))
-        in_affected = <int*>malloc(self.n_nodes * sizeof(int))
+        in_degree = <int*>malloc(self.n_nodes * sizeof(int))
         queue = <int*>malloc(self.n_nodes * sizeof(int))
+        new_order = <int*>malloc(self.n_nodes * sizeof(int))
         
-        if not new_order or not in_affected or not queue:
-            if new_order: free(new_order)
-            if in_affected: free(in_affected)
+        if not in_degree or not queue or not new_order:
+            if in_degree: free(in_degree)
             if queue: free(queue)
+            if new_order: free(new_order)
             return
         
-        memset(in_affected, 0, self.n_nodes * sizeof(int))
+        # Initialize in_degree to zero
+        memset(in_degree, 0, self.n_nodes * sizeof(int))
         
+        # Compute in-degrees for all nodes
+        for i in range(self.n_nodes):
+            for cur in range(self.n_nodes):
+                if self._adj_matrix[cur, i]:
+                    in_degree[i] += 1
+        
+        # Initialize queue with nodes that have in-degree 0
         qhead = 0
         qtail = 0
-        pos_u = self._position[u_idx]
+        for i in range(self.n_nodes):
+            if in_degree[i] == 0:
+                queue[qtail] = i
+                qtail += 1
         
-        queue[qtail] = v_idx
-        qtail += 1
-        in_affected[v_idx] = 1
-        
+        # Process nodes in topological order using Kahn's algorithm
+        ptr = 0
         while qhead < qtail:
             cur = queue[qhead]
             qhead += 1
+            new_order[ptr] = cur
+            ptr += 1
             
+            # Decrease in-degree of neighbors
             for i in range(self.n_nodes):
                 if self._adj_matrix[cur, i]:
-                    if not in_affected[i]:
-                        in_affected[i] = 1
+                    in_degree[i] -= 1
+                    if in_degree[i] == 0:
                         queue[qtail] = i
                         qtail += 1
         
-        free(queue)
+        # If we didn't process all nodes, there's a cycle (shouldn't happen)
+        # In that case, append remaining nodes to maintain all nodes in order
+        if ptr < self.n_nodes:
+            for i in range(self.n_nodes):
+                if in_degree[i] > 0:
+                    new_order[ptr] = i
+                    ptr += 1
         
-        ptr = 0
-        
-        for i in range(self.n_nodes):
-            if self._position[i] < pos_u and not in_affected[i]:
-                new_order[ptr] = i
-                ptr += 1
-        
-        for i in range(self.n_nodes):
-            j = self._topo_order[i]
-            if in_affected[j]:
-                new_order[ptr] = j
-                ptr += 1
-        
-        if not in_affected[u_idx]:
-            new_order[ptr] = u_idx
-            ptr += 1
-        
-        for i in range(self.n_nodes):
-            if self._position[i] > pos_u and not in_affected[i]:
-                new_order[ptr] = i
-                ptr += 1
-        
+        # Update topo_order and position
         for i in range(self.n_nodes):
             self._topo_order[i] = new_order[i]
             self._position[new_order[i]] = i
-            
+        
+        free(in_degree)
+        free(queue)
         free(new_order)
-        free(in_affected)
     
     cpdef CythonNASGraph copy(self):
         cdef CythonNASGraph g
@@ -271,13 +281,24 @@ cdef class CythonNASGraph:
         g._topo_order = np.copy(self._topo_order)
         g._position = np.copy(self._position)
         
+        # Don't copy cache - force rebuild on demand
         g._adj_cache = {}
         g._adj_dirty = True
+        
+        # Clear source cache to prevent memory buildup
+        if len(self._adj_cache) > 100:
+            self._adj_cache.clear()
+            self._adj_dirty = True
         
         return g
     
     def get_num_edges(self):
         return int(np.sum(self._adj_matrix))
+    
+    def clear_cache(self):
+        """Clear adjacency cache to free memory."""
+        self._adj_cache.clear()
+        self._adj_dirty = True
     
     def to_sparse_features(self):
         cdef int i, j
